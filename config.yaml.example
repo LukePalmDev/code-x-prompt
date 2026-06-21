@@ -1,0 +1,12 @@
+# ─── Prompt X — User Configuration ────────────────────────────────────────────
+# Copy this file to config.yaml and edit the values below.
+# config.yaml is gitignored so your paths stay private.
+
+# Directory where extracted prompts will be saved.
+# Supports absolute paths and ~ for home directory.
+#
+# Examples:
+#   ~/Documents/my-prompts
+#   /Users/you/Library/Mobile Documents/com~apple~CloudDocs/prompts   (iCloud)
+#   /Volumes/MyDrive/prompts
+output_dir: "~/Documents/prompt-x-output"

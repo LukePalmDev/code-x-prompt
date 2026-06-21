@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  macOS launchd plist for auto-starting the Telegram bot on login.
+
+  Setup:
+    1. Copy this file to ~/Library/LaunchAgents/com.promptx.listener.plist
+    2. Replace /ABSOLUTE/PATH/TO/code-x-prompt with the actual repo path
+    3. launchctl load ~/Library/LaunchAgents/com.promptx.listener.plist
+
+  To reload after changes:
+    launchctl unload ~/Library/LaunchAgents/com.promptx.listener.plist
+    launchctl load   ~/Library/LaunchAgents/com.promptx.listener.plist
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.promptx.listener</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>/ABSOLUTE/PATH/TO/code-x-prompt/prompt-listener.py</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/ABSOLUTE/PATH/TO/code-x-prompt</string>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>StandardOutPath</key>
+  <string>/tmp/promptx-listener.log</string>
+
+  <key>StandardErrorPath</key>
+  <string>/tmp/promptx-listener.log</string>
+</dict>
+</plist>

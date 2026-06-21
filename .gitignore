@@ -1,0 +1,26 @@
+# Environment & secrets
+.env
+
+# X auth database
+.twscrape_accounts.db
+
+# Image cache
+.img_cache/
+
+# User config (copy config.yaml.example → config.yaml and edit)
+config.yaml
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# macOS
+.DS_Store
+
+# Logs
+*.log
