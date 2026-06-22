@@ -2,3 +2,6 @@ twscrape>=0.12
 pyTelegramBotAPI>=4.14
 python-dotenv>=1.0
 pyyaml>=6.0
+browser-cookie3>=0.19
+easyocr>=1.7
+anthropic>=0.28.0

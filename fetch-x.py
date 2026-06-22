@@ -28,6 +28,8 @@ DB_PATH = REPO_DIR / ".twscrape_accounts.db"
 IMG_DIR = REPO_DIR / ".img_cache"
 IMG_DIR.mkdir(exist_ok=True)
 
+_SAFARI_ACCOUNT = "safari_auto"
+
 
 # ─── helpers ─────────────────────────────────────────────────────────────────
 
@@ -62,42 +64,65 @@ def collect_images(tweet) -> list[str]:
     return paths
 
 
-# ─── account setup ────────────────────────────────────────────────────────────
+# ─── account setup via Safari cookies (no login required) ────────────────────
+
+def _get_safari_cookies() -> dict:
+    """Extract X auth cookies from Safari — no browser launch needed."""
+    try:
+        import browser_cookie3
+        jar = browser_cookie3.safari(domain_name="x.com")
+        cookies = {c.name: c.value for c in jar}
+        if "auth_token" not in cookies or "ct0" not in cookies:
+            raise RuntimeError("auth_token or ct0 not found in Safari cookies. Make sure you are logged into x.com in Safari.")
+        return cookies
+    except ImportError:
+        raise RuntimeError("browser-cookie3 not installed. Run: pip3 install browser-cookie3")
+
 
 async def ensure_account(api: API):
+    """Ensure an active account exists, auto-loading cookies from Safari if needed."""
     accounts = await api.pool.get_all()
     active = [a for a in accounts if a.active]
     if active:
         return
 
-    print("\n─── X Account Setup (one-time) ───", file=sys.stderr)
-    print("twscrape requires an X account to read threads.", file=sys.stderr)
-    print("Credentials are saved locally in .twscrape_accounts.db\n", file=sys.stderr)
+    print("→ No active X account — loading cookies from Safari...", file=sys.stderr)
+    cookies = _get_safari_cookies()
+    cookie_str = json.dumps(cookies)
 
-    username = input("X Username (without @): ").strip()
-    password = input("X Password: ").strip()
-    email = input("X Email (used for 2FA verification, press Enter to skip): ").strip()
-    email_password = ""
-    if email:
-        email_password = input("Email password (press Enter to skip): ").strip()
+    # Remove stale entry if present
+    existing = [a for a in accounts if a.username == _SAFARI_ACCOUNT]
+    if existing:
+        await api.pool.delete_accounts(_SAFARI_ACCOUNT)
 
     await api.pool.add_account(
-        username=username,
-        password=password,
-        email=email or f"{username}@placeholder.com",
-        email_password=email_password or "placeholder",
+        username=_SAFARI_ACCOUNT,
+        password="n/a",
+        email="n/a@n/a.com",
+        email_password="n/a",
+        cookies=cookie_str,
     )
+    print("✓ Safari cookies loaded into twscrape", file=sys.stderr)
 
-    print("\n→ Logging in...", file=sys.stderr)
-    await api.pool.login_all()
 
-    accounts = await api.pool.get_all()
-    active = [a for a in accounts if a.active]
-    if not active:
-        print("❌ Login failed. Check your credentials and try again.", file=sys.stderr)
-        sys.exit(1)
-
-    print(f"✓ Logged in as @{username}\n", file=sys.stderr)
+async def refresh_cookies_if_needed(api: API):
+    """Re-sync Safari cookies so twscrape always has fresh tokens."""
+    try:
+        cookies = _get_safari_cookies()
+        cookie_str = json.dumps(cookies)
+        accounts = await api.pool.get_all()
+        safari_accounts = [a for a in accounts if a.username == _SAFARI_ACCOUNT]
+        if safari_accounts:
+            await api.pool.delete_accounts(_SAFARI_ACCOUNT)
+        await api.pool.add_account(
+            username=_SAFARI_ACCOUNT,
+            password="n/a",
+            email="n/a@n/a.com",
+            email_password="n/a",
+            cookies=cookie_str,
+        )
+    except Exception as e:
+        print(f"⚠️  Cookie refresh skipped: {e}", file=sys.stderr)
 
 
 # ─── main fetch ───────────────────────────────────────────────────────────────
@@ -106,6 +131,8 @@ async def fetch(url: str) -> dict:
     tweet_id = extract_tweet_id(url)
     api = API(str(DB_PATH))
 
+    # Always refresh Safari cookies so we have the latest session tokens
+    await refresh_cookies_if_needed(api)
     await ensure_account(api)
 
     print(f"→ Fetching tweet {tweet_id}...", file=sys.stderr)

@@ -19,6 +19,19 @@ Expand `~` to the home directory if present. All prompt files must be saved unde
 
 If `config.yaml` is missing, ask the user to create it from `config.yaml.example` before proceeding.
 
+## ⚡ Token Optimization
+
+**Your current usage**: ~10% of a 5-hour session per post (~1,650 tokens)
+**After optimization**: ~530 tokens/post (66% reduction)
+**Result**: 3x more posts from same token budget
+
+See `OPTIMIZATION.md` and `DEPLOY.md` for details. TL;DR:
+```bash
+python3 optimize-pipeline.py <url>  # Single call, 66% cheaper
+```
+
+---
+
 ## Workflow: Processing an X Post URL
 
 When the user provides an X/Twitter URL, follow these steps:

@@ -49,7 +49,7 @@ def run_pipeline(url: str) -> str:
             cwd=PROJECT_DIR,
             capture_output=True,
             text=True,
-            timeout=180,
+            timeout=300,
             env=ENV,
         )
         output = (result.stdout or result.stderr or "").strip()
