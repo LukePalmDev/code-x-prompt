@@ -13,7 +13,6 @@ Daily use:
   Mac:    runs /x-prompt automatically and replies with the created files
 """
 
-import json
 import os
 import re
 import shutil
@@ -43,34 +42,24 @@ ENV = {
 
 
 def run_pipeline(url: str) -> str:
-    """Run optimized extraction pipeline (66% cheaper than /x-prompt)."""
+    """Run /x-prompt skill via Claude CLI."""
     try:
         result = subprocess.run(
-            ["python3", str(PROJECT_DIR / "optimize-pipeline.py"), url],
+            [CLAUDE_CMD, "--dangerously-skip-permissions", "-p", f"/x-prompt {url}"],
             cwd=PROJECT_DIR,
             capture_output=True,
             text=True,
-            timeout=600,  # 10 min (first run of easyocr downloads models, slow)
+            timeout=300,
             env=ENV,
         )
-        if result.returncode != 0:
-            return f"❌ Error: {result.stderr[:200]}"
-
-        # Parse JSON output and extract summary
-        try:
-            output = json.loads(result.stdout)
-            topic = output.get("topic", "?")
-            count = output.get("prompts_extracted", 0)
-            return f"✅ Fatto. {count} prompt in `{topic}`"
-        except:
-            # Fallback if JSON parsing fails
-            return "✅ Fatto"
+        output = (result.stdout or result.stderr or "").strip()
+        return output[:4000] if output else "Pipeline completata."
     except subprocess.TimeoutExpired:
-        return "⏱ Timeout (10 min). Se è il primo post, i modelli OCR stavano scaricando. Riprova."
+        return "⏱ Timeout dopo 5 minuti — riprova."
     except FileNotFoundError:
-        return "❌ optimize-pipeline.py not found"
+        return "❌ Claude CLI non trovato. Installa con: npm install -g @anthropic-ai/claude-code"
     except Exception as e:
-        return f"❌ Error: {str(e)[:100]}"
+        return f"❌ Errore: {e}"
 
 
 def main():
