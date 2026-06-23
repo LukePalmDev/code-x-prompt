@@ -19,29 +19,19 @@ python3 fetch-x.py <url>
 ```
 Output JSON: `author`, `tweet_text`, `thread[]`, `images[]`
 
-Estrai il `tweet_id` dall'URL (i numeri dopo `/status/`).
-
 **Ignora le immagini** — i prompt sono sempre nel testo del thread.
 
 ### 3. Topic
 Identifica l'argomento in italiano (es. `Dieta`, `Copywriting`, `NotebookLM`). Kebab-case se multi-parola.
 
-### 4. Cartelle — REGOLA ASSOLUTA
-**Usa SEMPRE questa struttura, senza eccezioni:**
+**Se la cartella `{output_dir}/{Topic}/` esiste già**, scegli un nome più specifico basato sul contenuto del post. Esempio: `NotebookLM` esiste → usa `NotebookLM-Avanzato`, `NotebookLM-Studio`, ecc. Non usare mai numeri (`NotebookLM-2`).
+
+### 4. Cartelle
 ```
-{output_dir}/{Topic}/{tweet_id}/
+{output_dir}/{Topic}/
   Inglese/
   Italiano/
 ```
-
-Esempio: se tweet_id è `1234567890` e topic è `Dieta`:
-```
-/output/Dieta/1234567890/Inglese/01-file.md
-/output/Dieta/1234567890/Italiano/01-file.md
-```
-
-**Non scrivere MAI direttamente in `{Topic}/`. Sempre e solo in `{Topic}/{tweet_id}/`.**
-**Non controllare se la cartella esiste. Creala e basta con `mkdir -p`.**
 
 ### 5. Estrai prompt
 Ogni prompt → file separato. Numerati `01-`, `02-`, ecc. Nomi kebab-case.
@@ -63,7 +53,7 @@ Traduci titolo e corpo. Mantieni placeholder `[topic]`, `{var}` invariati.
 
 ### 8. Risposta finale
 ```
-Fatto. {N} prompt in '{Topic}/{tweet_id}'.
+Fatto. {N} prompt in '{Topic}'.
 ```
 Nient'altro.
 
