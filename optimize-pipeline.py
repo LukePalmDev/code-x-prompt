@@ -177,9 +177,21 @@ Rules:
     return result
 
 
-def create_file_structure(output_dir: str, topic: str, prompts: list) -> list[str]:
-    """Create folder structure and write prompt files."""
+def create_file_structure(output_dir: str, topic: str, prompts: list, tweet_id: str = "") -> list[str]:
+    """Create folder structure and write prompt files.
+
+    If topic folder exists, create subfolder with tweet_id to avoid conflicts.
+    """
     base_path = Path(output_dir) / topic
+
+    # If folder exists and we have tweet_id, use subfolder
+    if base_path.exists() and tweet_id:
+        base_path = base_path / f"post-{tweet_id}"
+
+    # Warn if overwriting
+    if base_path.exists():
+        print(f"⚠️  WARNING: Folder exists, may overwrite files: {base_path}", file=sys.stderr)
+
     en_dir = base_path / "Inglese"
     it_dir = base_path / "Italiano"
 
@@ -217,8 +229,12 @@ async def main():
     url = sys.argv[1]
 
     try:
+        # Extract tweet ID for unique folder naming
+        tweet_id_match = re.search(r"/status/(\d+)", url)
+        tweet_id = tweet_id_match.group(1) if tweet_id_match else ""
+
         output_dir = load_config()
-        print(f"→ Fetching post...", file=sys.stderr)
+        print(f"→ Fetching post {tweet_id}...", file=sys.stderr)
         post_data = fetch_post(url)
 
         # Extract OCR text from images (no Claude tokens)
@@ -240,7 +256,7 @@ async def main():
 
         # Create folder structure and save files
         print(f"→ Creating files in {output_dir}...", file=sys.stderr)
-        saved_files = create_file_structure(output_dir, result["topic_italian"], result["prompts"])
+        saved_files = create_file_structure(output_dir, result["topic_italian"], result["prompts"], tweet_id)
 
         print(f"✓ Extracted {len(result['prompts'])} prompts", file=sys.stderr)
         print(f"✓ Topic: {result['topic_italian']}", file=sys.stderr)

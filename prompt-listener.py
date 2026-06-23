@@ -50,7 +50,7 @@ def run_pipeline(url: str) -> str:
             cwd=PROJECT_DIR,
             capture_output=True,
             text=True,
-            timeout=300,
+            timeout=600,  # 10 min (first run of easyocr downloads models, slow)
             env=ENV,
         )
         if result.returncode != 0:
@@ -66,7 +66,7 @@ def run_pipeline(url: str) -> str:
             # Fallback if JSON parsing fails
             return "✅ Fatto"
     except subprocess.TimeoutExpired:
-        return "❌ Timeout (3 min)"
+        return "⏱ Timeout (10 min). Se è il primo post, i modelli OCR stavano scaricando. Riprova."
     except FileNotFoundError:
         return "❌ optimize-pipeline.py not found"
     except Exception as e:
