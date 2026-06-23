@@ -15,6 +15,7 @@ Output (stdout): JSON with keys:
 
 import asyncio
 import json
+import os
 import re
 import sys
 import urllib.request
@@ -127,7 +128,7 @@ async def refresh_cookies_if_needed(api: API):
 
 # ─── main fetch ───────────────────────────────────────────────────────────────
 
-async def fetch(url: str) -> dict:
+async def fetch(url: str, skip_images: bool = False) -> dict:
     tweet_id = extract_tweet_id(url)
     api = API(str(DB_PATH))
 
@@ -142,7 +143,7 @@ async def fetch(url: str) -> dict:
 
     author_id = tweet.user.id
     main_text = tweet.rawContent
-    images = collect_images(tweet)
+    images = [] if skip_images else collect_images(tweet)
 
     thread_tweets = []
     print("→ Fetching thread...", file=sys.stderr)
@@ -151,7 +152,7 @@ async def fetch(url: str) -> dict:
             thread_tweets.append({
                 "id": str(t.id),
                 "text": t.rawContent,
-                "images": collect_images(t),
+                "images": [] if skip_images else collect_images(t),
             })
 
     print(f"✓ Thread: {len(thread_tweets)} additional tweets, {len(images)} images", file=sys.stderr)
@@ -170,7 +171,8 @@ def main():
         sys.exit(1)
 
     url = sys.argv[1]
-    result = asyncio.run(fetch(url))
+    skip_images = os.environ.get("SKIP_IMAGES", "").lower() in ("1", "true", "yes")
+    result = asyncio.run(fetch(url, skip_images=skip_images))
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
 

@@ -14,6 +14,7 @@ Usage:
 
 import asyncio
 import json
+import os
 import re
 import subprocess
 import sys
@@ -58,11 +59,14 @@ def extract_text_from_image(image_path: str) -> str:
 
 
 def fetch_post(url: str) -> dict:
-    """Call fetch-x.py to get the tweet."""
+    """Call fetch-x.py to get the tweet (skip images, prompts are in text)."""
+    env = os.environ.copy()
+    env["SKIP_IMAGES"] = "1"  # Prompts are in tweet text, skip image downloads
     result = subprocess.run(
         ["python3", str(REPO_DIR / "fetch-x.py"), url],
         capture_output=True,
         text=True,
+        env=env,
     )
     if result.returncode != 0:
         raise RuntimeError(f"fetch-x.py failed: {result.stderr}")

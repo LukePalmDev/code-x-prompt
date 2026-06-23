@@ -13,6 +13,7 @@ Daily use:
   Mac:    runs /x-prompt automatically and replies with the created files
 """
 
+import json
 import os
 import re
 import shutil
@@ -42,28 +43,34 @@ ENV = {
 
 
 def run_pipeline(url: str) -> str:
-    """Run 'claude --dangerously-skip-permissions -p /x-prompt <url>'."""
+    """Run optimized extraction pipeline (66% cheaper than /x-prompt)."""
     try:
         result = subprocess.run(
-            [CLAUDE_CMD, "--dangerously-skip-permissions", "-p", f"/x-prompt {url}"],
+            ["python3", str(PROJECT_DIR / "optimize-pipeline.py"), url],
             cwd=PROJECT_DIR,
             capture_output=True,
             text=True,
             timeout=300,
             env=ENV,
         )
-        output = (result.stdout or result.stderr or "").strip()
-        return output[:4000] if output else "Pipeline completed (no output)."
+        if result.returncode != 0:
+            return f"❌ Error: {result.stderr[:200]}"
+
+        # Parse JSON output and extract summary
+        try:
+            output = json.loads(result.stdout)
+            topic = output.get("topic", "?")
+            count = output.get("prompts_extracted", 0)
+            return f"✅ Fatto. {count} prompt in `{topic}`"
+        except:
+            # Fallback if JSON parsing fails
+            return "✅ Fatto"
     except subprocess.TimeoutExpired:
-        return "⏱ Timeout after 3 minutes — please try again."
+        return "❌ Timeout (3 min)"
     except FileNotFoundError:
-        return (
-            "❌ Command 'claude' not found.\n"
-            "Make sure Claude Code CLI is installed and in PATH.\n"
-            "Install with: npm install -g @anthropic-ai/claude-code"
-        )
+        return "❌ optimize-pipeline.py not found"
     except Exception as e:
-        return f"❌ Error: {e}"
+        return f"❌ Error: {str(e)[:100]}"
 
 
 def main():
