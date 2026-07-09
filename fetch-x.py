@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 fetch-x.py — Fetch a tweet + full thread from X without a browser.
-Uses twscrape (manages X auth tokens automatically).
+Uses the public FxTwitter API, with twscrape as an authenticated fallback.
 
 Usage:
   python3 fetch-x.py <x-post-url>
@@ -18,11 +18,18 @@ import json
 import os
 import re
 import sys
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
-import twscrape
-from twscrape import API, gather
+try:
+    import twscrape
+    from twscrape import API, gather
+    TWSCRAPE_AVAILABLE = True
+except ImportError:
+    TWSCRAPE_AVAILABLE = False
+    API = None  # type: ignore
+    gather = None  # type: ignore
 
 REPO_DIR = Path(__file__).parent
 DB_PATH = REPO_DIR / ".twscrape_accounts.db"
@@ -30,6 +37,8 @@ IMG_DIR = REPO_DIR / ".img_cache"
 IMG_DIR.mkdir(exist_ok=True)
 
 _SAFARI_ACCOUNT = "safari_auto"
+_FXTWITTER_API = "https://api.fxtwitter.com/2/thread/{tweet_id}"
+_USER_AGENT = "code-x-prompt/1.0"
 
 
 # ─── helpers ─────────────────────────────────────────────────────────────────
@@ -65,6 +74,89 @@ def collect_images(tweet) -> list[str]:
     return paths
 
 
+def download_public_image(url: str, tweet_id: str, idx: int) -> str:
+    suffix = Path(urllib.parse.urlsplit(url).path).suffix.lower()
+    if suffix not in {".jpg", ".jpeg", ".png", ".webp"}:
+        suffix = ".jpg"
+
+    fname = IMG_DIR / f"{tweet_id}_{idx}{suffix}"
+    if not fname.exists():
+        req = urllib.request.Request(url, headers={"User-Agent": _USER_AGENT})
+        with urllib.request.urlopen(req, timeout=30) as response, open(fname, "wb") as file:
+            file.write(response.read())
+    return str(fname)
+
+
+def collect_public_images(status: dict) -> list[str]:
+    paths = []
+    photos = (status.get("media") or {}).get("photos") or []
+    for idx, photo in enumerate(photos):
+        url = photo.get("url")
+        if not url:
+            continue
+        try:
+            paths.append(download_public_image(url, str(status["id"]), idx))
+        except Exception as exc:
+            print(f"⚠️  Could not download image {url}: {exc}", file=sys.stderr)
+    return paths
+
+
+def fetch_via_fxtwitter(url: str, skip_images: bool = False) -> dict:
+    """Fetch a public X thread without browser cookies."""
+    tweet_id = extract_tweet_id(url)
+    endpoint = _FXTWITTER_API.format(tweet_id=tweet_id)
+    request = urllib.request.Request(endpoint, headers={"User-Agent": _USER_AGENT})
+
+    with urllib.request.urlopen(request, timeout=30) as response:
+        payload = json.load(response)
+
+    if payload.get("code") != 200:
+        raise RuntimeError(payload.get("message") or f"FxTwitter returned {payload.get('code')}")
+
+    root = payload.get("status")
+    if not isinstance(root, dict) or root.get("type") != "status":
+        raise RuntimeError("FxTwitter returned no usable status.")
+
+    author = (root.get("author") or {}).get("screen_name")
+    if not author:
+        raise RuntimeError("FxTwitter returned a status without an author.")
+
+    root_id = str(root["id"])
+    thread_tweets = []
+    seen_ids = {root_id}
+
+    for status in payload.get("thread") or []:
+        if not isinstance(status, dict) or status.get("type") != "status":
+            continue
+
+        status_id = str(status.get("id") or "")
+        status_author = (status.get("author") or {}).get("screen_name")
+        text = status.get("text")
+        if not status_id or status_id in seen_ids or status_author != author or not text:
+            continue
+
+        seen_ids.add(status_id)
+        thread_tweets.append({
+            "id": status_id,
+            "text": text,
+            "images": [] if skip_images else collect_public_images(status),
+        })
+
+    images = [] if skip_images else collect_public_images(root)
+    print(
+        f"✓ FxTwitter thread: {len(thread_tweets)} additional tweets, "
+        f"{len(images)} root images",
+        file=sys.stderr,
+    )
+
+    return {
+        "author": author,
+        "tweet_text": root.get("text") or "",
+        "thread": thread_tweets,
+        "images": images,
+    }
+
+
 # ─── account setup via Safari cookies (no login required) ────────────────────
 
 def _get_safari_cookies() -> dict:
@@ -87,23 +179,50 @@ async def ensure_account(api: API):
     if active:
         return
 
-    print("→ No active X account — loading cookies from Safari...", file=sys.stderr)
-    cookies = _get_safari_cookies()
+    # Try Safari first
+    cookies = None
+    try:
+        print("→ No active X account — loading cookies from Safari...", file=sys.stderr)
+        cookies = _get_safari_cookies()
+        account_name = _SAFARI_ACCOUNT
+    except Exception as e:
+        print(f"⚠️  Safari failed: {e}", file=sys.stderr)
+        # Try alternative browsers as fallback
+        try:
+            import browser_cookie3
+            for browser_name in ['chrome', 'firefox', 'edge', 'brave']:
+                try:
+                    browser_func = getattr(browser_cookie3, browser_name, None)
+                    if browser_func:
+                        jar = browser_func(domain_name="x.com")
+                        cookies = {c.name: c.value for c in jar}
+                        if "auth_token" in cookies and "ct0" in cookies:
+                            print(f"✓ Found cookies in {browser_name}", file=sys.stderr)
+                            account_name = f"{browser_name}_auto"
+                            break
+                except Exception:
+                    continue
+        except Exception as fallback_e:
+            print(f"⚠️  No browsers with X cookies found: {fallback_e}", file=sys.stderr)
+
+    if not cookies or "auth_token" not in cookies or "ct0" not in cookies:
+        raise RuntimeError("Cannot find X auth cookies in any browser. Make sure you are logged into x.com in Safari or Chrome.")
+
     cookie_str = json.dumps(cookies)
 
     # Remove stale entry if present
-    existing = [a for a in accounts if a.username == _SAFARI_ACCOUNT]
+    existing = [a for a in accounts if a.username == account_name]
     if existing:
-        await api.pool.delete_accounts(_SAFARI_ACCOUNT)
+        await api.pool.delete_accounts(account_name)
 
     await api.pool.add_account(
-        username=_SAFARI_ACCOUNT,
+        username=account_name,
         password="n/a",
         email="n/a@n/a.com",
         email_password="n/a",
         cookies=cookie_str,
     )
-    print("✓ Safari cookies loaded into twscrape", file=sys.stderr)
+    print(f"✓ Cookies loaded into twscrape from {account_name}", file=sys.stderr)
 
 
 async def refresh_cookies_if_needed(api: API):
@@ -124,11 +243,39 @@ async def refresh_cookies_if_needed(api: API):
         )
     except Exception as e:
         print(f"⚠️  Cookie refresh skipped: {e}", file=sys.stderr)
+        # Try alternative browsers as fallback
+        try:
+            import browser_cookie3
+            for browser_name in ['chrome', 'firefox', 'edge', 'brave']:
+                try:
+                    browser_func = getattr(browser_cookie3, browser_name, None)
+                    if browser_func:
+                        jar = browser_func(domain_name="x.com")
+                        cookies = {c.name: c.value for c in jar}
+                        if "auth_token" in cookies and "ct0" in cookies:
+                            cookie_str = json.dumps(cookies)
+                            accounts = await api.pool.get_all()
+                            existing = [a for a in accounts if a.username == f"{browser_name}_auto"]
+                            if existing:
+                                await api.pool.delete_accounts(f"{browser_name}_auto")
+                            await api.pool.add_account(
+                                username=f"{browser_name}_auto",
+                                password="n/a",
+                                email="n/a@n/a.com",
+                                email_password="n/a",
+                                cookies=cookie_str,
+                            )
+                            print(f"✓ Using cookies from {browser_name}", file=sys.stderr)
+                            return
+                except Exception:
+                    continue
+        except Exception as fallback_e:
+            print(f"⚠️  Browser fallback also failed: {fallback_e}", file=sys.stderr)
 
 
 # ─── main fetch ───────────────────────────────────────────────────────────────
 
-async def fetch(url: str, skip_images: bool = False) -> dict:
+async def fetch_via_twscrape(url: str, skip_images: bool = False) -> dict:
     tweet_id = extract_tweet_id(url)
     api = API(str(DB_PATH))
 
@@ -163,6 +310,29 @@ async def fetch(url: str, skip_images: bool = False) -> dict:
         "thread": thread_tweets,
         "images": images,
     }
+
+
+async def fetch(url: str, skip_images: bool = False) -> dict:
+    try:
+        print("→ Fetching public thread via FxTwitter...", file=sys.stderr)
+        return fetch_via_fxtwitter(url, skip_images=skip_images)
+    except Exception as exc:
+        if not TWSCRAPE_AVAILABLE:
+            raise RuntimeError(
+                f"FxTwitter failed and twscrape not installed: {exc}. "
+                "Install with: pip install twscrape"
+            ) from exc
+
+        print(
+            f"⚠️  Public fetch failed ({exc}); trying authenticated twscrape fallback...",
+            file=sys.stderr,
+        )
+        try:
+            return await fetch_via_twscrape(url, skip_images=skip_images)
+        except Exception as fallback_exc:
+            raise RuntimeError(
+                f"Both FxTwitter and twscrape failed. FxTwitter: {exc}. twscrape: {fallback_exc}"
+            ) from fallback_exc
 
 
 def main():
