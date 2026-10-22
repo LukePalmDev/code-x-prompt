@@ -270,7 +270,7 @@ def check_runtime():
     home = Path.home()
     synced = next((home / name for name in SYNCED_FOLDERS if home / name in PROJECT_DIR.parents), None)
     if synced:
-        raise ValueError(f"il progetto è in {synced}, sincronizzata con iCloud: spostalo fuori, per esempio in ~/Developer")
+        raise ValueError(f"il progetto è in {synced}, sincronizzata con iCloud: fai girare il servizio da un clone fuori, per esempio ~/Developer/code-x-prompt")
     evicted = 0
     for root, dirs, files in os.walk(PROJECT_DIR):
         dirs[:] = [name for name in dirs if name != ".git"]
