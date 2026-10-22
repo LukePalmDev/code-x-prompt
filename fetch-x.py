@@ -57,7 +57,7 @@ def download_image(url: str, tweet_id: int, idx: int) -> str:
             url + "?format=jpg&name=large",
             headers={"User-Agent": "Mozilla/5.0"},
         )
-        with urllib.request.urlopen(req) as r, open(fname, "wb") as f:
+        with urllib.request.urlopen(req, timeout=30) as r, open(fname, "wb") as f:
             f.write(r.read())
     return str(fname)
 

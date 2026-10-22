@@ -1,24 +1,36 @@
 #!/usr/bin/env python3
 """
-prompt-listener.py — Telegram bot that receives X post URLs and runs the full pipeline.
+prompt-listener.py — Telegram bot that queues X post URLs and processes them.
 
 Setup:
   1. Create a bot via @BotFather → get the token
   2. Copy .env.example to .env and set TELEGRAM_BOT_TOKEN
-  3. pip install -r requirements.txt
-  4. python3 prompt-listener.py
+  3. pip install -r requirements-bot.txt
+  4. python3 install-service.py --install
 
 Daily use:
   iPhone: X post → Share → Telegram → [bot name]
-  Mac:    runs the workflow in CLAUDE.md and replies with the created files
+  Mac:    the link is saved in a persistent queue, processed by pipeline.py,
+          and the bot replies with the result. /stato checks every component.
+
+Manual run (same pipeline, no Telegram):
+  .venv/bin/python prompt-listener.py --process <url>
 """
 
+import argparse
+import contextlib
+import json
+import logging
 import os
 import re
-import shutil
+import signal
+import socket
 import subprocess
 import sys
+import threading
 import time
+import urllib.request
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 try:
@@ -29,154 +41,426 @@ except ImportError:
 
 import telebot
 
-BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-PROJECT_DIR = Path(__file__).parent
+import pipeline
 
-CLAUDE_CMD = shutil.which("claude") or "claude"
+log = logging.getLogger("promptx")
+
+BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+PROJECT_DIR = pipeline.PROJECT_DIR
+QUEUE_DIR = pipeline.CACHE_DIR / "queue"
+FAILED_DIR = pipeline.CACHE_DIR / "failed"
+STATE_FILE = pipeline.CACHE_DIR / "state.json"
+LOG_FILE = PROJECT_DIR / "logs" / "listener.log"
 
 X_URL_RE = re.compile(r'https?://(?:twitter\.com|x\.com)/\S+/status/\d+\S*')
 
-MAX_PIPELINE_ATTEMPTS = 3
-RETRY_DELAYS = (5, 15)
-TRANSIENT_ERROR_MARKERS = (
-    "connection closed",
-    "connection reset",
-    "network error",
-    "overloaded",
-    "rate limit",
-    "request timed out",
-    "service unavailable",
-    "socket hang up",
-    "status code 429",
-    "status code 500",
-    "status code 502",
-    "status code 503",
-    "status code 529",
-)
+# Delays before retrying a job that failed for a transient reason.
+RETRY_LATER = (15 * 60, 60 * 60, 3 * 60 * 60)
+IDLE_POLL_SECONDS = 60
+FXTWITTER_PROBE = "https://api.fxtwitter.com/2/status/20"
 
-ENV = {
-    **os.environ,
-    "PATH": os.environ.get("PATH", "") + ":/usr/local/bin:/usr/bin:/bin",
-}
+# A process cut off from Telegram with the network up is wedged: exit so launchd restarts it.
+WATCHDOG_INTERVAL = 60
+STALL_RESTART_SECONDS = 15 * 60
+TELEGRAM_ADDRESS = ("api.telegram.org", 443)
+
+# macOS flags files evicted by iCloud; a launchd job cannot read them (EDEADLK).
+SF_DATALESS = 0x40000000
+SYNCED_FOLDERS = ("Documents", "Desktop", "Library/Mobile Documents")
+
+state_lock = threading.Lock()
 
 
-def is_transient_error(message: str) -> bool:
-    normalized = message.lower()
-    return any(marker in normalized for marker in TRANSIENT_ERROR_MARKERS)
+class SuppressRepeats(logging.Filter):
+    """During an outage telebot logs a traceback every few seconds: keep one per interval."""
+
+    def __init__(self, interval: int = 600):
+        super().__init__()
+        self.interval = interval
+        self.last_logged = {}
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        message, now = record.getMessage(), time.time()
+        if now - self.last_logged.get(message, 0) < self.interval:
+            return False
+        self.last_logged[message] = now
+        return True
 
 
-def run_pipeline(url: str) -> str:
-    """Run the project workflow via Claude CLI."""
-    prompt = (
-        "Segui rigorosamente le istruzioni nel file CLAUDE.md di questo progetto. "
-        "Elabora il seguente link X ed esegui l'intero workflow, inclusa la "
-        "creazione dei file nella output_dir configurata. Se un tentativo precedente "
-        "ha già creato una cartella o alcuni file per lo stesso contenuto, riprendi e "
-        "completa quella cartella senza crearne una duplicata e senza sovrascrivere "
-        f"file già completi:\n{url}"
+def setup_logging() -> None:
+    LOG_FILE.parent.mkdir(exist_ok=True)
+    file_handler = RotatingFileHandler(LOG_FILE, maxBytes=1_000_000, backupCount=3, encoding="utf-8")
+    # Telegram long-polling timeouts are routine and recover by themselves.
+    file_handler.addFilter(lambda record: "Read timed out" not in record.getMessage())
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+        handlers=[logging.StreamHandler(sys.stdout), file_handler],
     )
+    logging.getLogger("TeleBot").addFilter(SuppressRepeats())
 
+
+def redact(text: str) -> str:
+    """Request errors quote the URL, which contains the bot token."""
+    return text.replace(BOT_TOKEN, "***") if BOT_TOKEN else text
+
+
+# ─── persistent state ─────────────────────────────────────────────────────────
+
+def read_json(path: Path, default):
     try:
-        print(f"Processing URL: {url}", flush=True)
-        last_error = "Errore sconosciuto"
-
-        for attempt in range(1, MAX_PIPELINE_ATTEMPTS + 1):
-            command = [CLAUDE_CMD, "--dangerously-skip-permissions"]
-            if attempt > 1:
-                command.extend(["--model", "sonnet"])
-            command.extend(["-p", prompt])
-
-            try:
-                result = subprocess.run(
-                    command,
-                    cwd=PROJECT_DIR,
-                    capture_output=True,
-                    text=True,
-                    timeout=600,
-                    env=ENV,
-                )
-            except subprocess.TimeoutExpired:
-                last_error = "Il tentativo ha superato 10 minuti."
-                transient = True
-            else:
-                if result.returncode == 0:
-                    output = (result.stdout or "").strip()
-                    print(f"Pipeline completed on attempt {attempt}.", flush=True)
-                    return output[:4000] if output else "Pipeline completata."
-
-                last_error = (
-                    result.stderr or result.stdout or "Errore sconosciuto"
-                ).strip()
-                transient = is_transient_error(last_error)
-
-            print(
-                f"Pipeline attempt {attempt}/{MAX_PIPELINE_ATTEMPTS} failed: "
-                f"{last_error}",
-                flush=True,
-            )
-
-            if not transient or attempt == MAX_PIPELINE_ATTEMPTS:
-                break
-
-            delay = RETRY_DELAYS[attempt - 1]
-            print(f"Retrying in {delay} seconds...", flush=True)
-            time.sleep(delay)
-
-        attempt_label = "tentativo" if attempt == 1 else "tentativi"
-        return (
-            f"❌ Pipeline non riuscita dopo {attempt} {attempt_label}:\n"
-            f"{last_error[:3700]}"
-        )
-    except FileNotFoundError:
-        return "❌ Claude CLI non trovato. Installa con: npm install -g @anthropic-ai/claude-code"
-    except Exception as e:
-        return f"❌ Errore: {e}"
+        return json.loads(path.read_text())
+    except (OSError, ValueError):
+        return default
 
 
-def main():
+def update_state(**changes) -> dict:
+    with state_lock:
+        state = read_json(STATE_FILE, {})
+        state.update(changes)
+        pipeline.write_json(STATE_FILE, state)
+        return state
+
+
+# ─── queue ────────────────────────────────────────────────────────────────────
+
+def job_path(url: str) -> Path:
+    return QUEUE_DIR / f"{pipeline.tweet_id(url)}.json"
+
+
+def enqueue(url: str, chat_id: int, message_id: int) -> bool:
+    """Persist the job before acknowledging it; False if already queued."""
+    path = job_path(url)
+    if path.exists():
+        return False
+    pipeline.write_json(path, {
+        "url": url, "chat_id": chat_id, "message_id": message_id,
+        "received": time.time(), "rounds": 0, "retry_at": 0,
+    })
+    return True
+
+
+def queued_jobs() -> list:
+    jobs = [(read_json(path, None), path) for path in QUEUE_DIR.glob("*.json")]
+    return sorted(((job, path) for job, path in jobs if job), key=lambda item: item[0]["received"])
+
+
+def next_job():
+    now = time.time()
+    return next(((job, path) for job, path in queued_jobs() if job["retry_at"] <= now), (None, None))
+
+
+def archive_failed(path: Path) -> None:
+    FAILED_DIR.mkdir(parents=True, exist_ok=True)
+    os.replace(path, FAILED_DIR / path.name)
+
+
+# ─── Telegram ─────────────────────────────────────────────────────────────────
+
+def send(bot, chat_id, text: str, reply_to=None) -> bool:
+    """A Telegram hiccup must neither drop the job nor hide its result."""
+    reply = telebot.types.ReplyParameters(reply_to, allow_sending_without_reply=True) if reply_to else None
+    for delay in (0, 5, 15, 60):
+        time.sleep(delay)
+        try:
+            bot.send_message(chat_id, text[:4000], reply_parameters=reply)
+            return True
+        except Exception as exc:
+            log.warning("Telegram send failed: %s", redact(str(exc)))
+    return False
+
+
+def notify_owner(bot, text: str) -> None:
+    owner = read_json(STATE_FILE, {}).get("owner_chat_id")
+    if owner:
+        send(bot, owner, text)
+
+
+@contextlib.contextmanager
+def system_awake():
+    """Prevent idle sleep from aborting Claude mid-run (a closed lid still sleeps)."""
+    try:
+        keeper = subprocess.Popen(["/usr/bin/caffeinate", "-i"])
+    except OSError:
+        keeper = None
+    try:
+        yield
+    finally:
+        if keeper:
+            keeper.terminate()
+            keeper.wait()
+
+
+def handle_job(bot, job: dict, path: Path) -> None:
+    url = job["url"]
+    log.info("Processing %s (round %d)", url, job["rounds"] + 1)
+    try:
+        with system_awake():
+            result = pipeline.process(job, save=lambda current: pipeline.write_json(path, current))
+    except pipeline.PipelineError as exc:
+        if exc.transient and job["rounds"] < len(RETRY_LATER):
+            delay = RETRY_LATER[job["rounds"]]
+            job.update(rounds=job["rounds"] + 1, retry_at=time.time() + delay, last_error=str(exc))
+            pipeline.write_json(path, job)
+            retry_time = time.strftime("%H:%M", time.localtime(job["retry_at"]))
+            log.warning("Job %s postponed to %s: %s", url, retry_time, exc)
+            send(bot, job["chat_id"], f"⚠️ Non riuscito per ora:\n{exc}\n\nRiprovo da solo alle {retry_time}.", job["message_id"])
+        else:
+            log.error("Job %s failed: %s", url, exc)
+            archive_failed(path)
+            update_state(last_failure={"time": time.time(), "url": url, "error": str(exc)})
+            send(bot, job["chat_id"], f"❌ Elaborazione non riuscita:\n{exc}", job["message_id"])
+    except Exception as exc:
+        # A bug: keep the job for inspection and say so instead of going silent.
+        log.exception("Unexpected error on %s", url)
+        archive_failed(path)
+        update_state(last_failure={"time": time.time(), "url": url, "error": repr(exc)})
+        send(bot, job["chat_id"], f"❌ Errore interno: {exc!r}\nDettagli in {LOG_FILE}", job["message_id"])
+    else:
+        path.unlink()
+        update_state(last_success={"time": time.time(), "url": url, "result": result})
+        send(bot, job["chat_id"], f"✅ {result}", job["message_id"])
+
+
+def worker(bot, wake: threading.Event) -> None:
+    while True:
+        try:
+            job, path = next_job()
+            if job is None:
+                wake.wait(IDLE_POLL_SECONDS)
+                wake.clear()
+                continue
+            handle_job(bot, job, path)
+        except Exception:
+            log.exception("Worker loop error")
+            time.sleep(IDLE_POLL_SECONDS)
+
+
+# ─── health checks ────────────────────────────────────────────────────────────
+
+def check_claude():
+    result = subprocess.run(
+        [pipeline.CLAUDE_CMD, "auth", "status"], capture_output=True, text=True,
+        timeout=30, env=pipeline.ENV,
+    )
+    if result.returncode or not json.loads(result.stdout).get("loggedIn"):
+        raise ValueError("non autenticato: esegui claude auth login")
+    return "autenticato"
+
+
+def check_output():
+    directory = pipeline.output_directory()
+    if not directory.is_dir():
+        raise ValueError(f"cartella assente: {directory}")
+    if not os.access(directory, os.W_OK):
+        raise ValueError(f"cartella non scrivibile: {directory}")
+    return f"{sum(path.is_dir() for path in directory.iterdir())} cartelle"
+
+
+def check_fxtwitter():
+    request = urllib.request.Request(FXTWITTER_PROBE, headers={"User-Agent": "code-x-prompt/1.0"})
+    with urllib.request.urlopen(request, timeout=15) as response:
+        if json.load(response).get("code") != 200:
+            raise ValueError("risposta inattesa")
+    return "raggiungibile"
+
+
+def check_runtime():
+    """The service reads code, venv and config at any time: none of it may live in iCloud."""
+    home = Path.home()
+    synced = next((home / name for name in SYNCED_FOLDERS if home / name in PROJECT_DIR.parents), None)
+    if synced:
+        raise ValueError(f"il progetto è in {synced}, sincronizzata con iCloud: spostalo fuori, per esempio in ~/Developer")
+    evicted = 0
+    for root, dirs, files in os.walk(PROJECT_DIR):
+        dirs[:] = [name for name in dirs if name != ".git"]
+        evicted += sum(bool(os.lstat(os.path.join(root, name)).st_flags & SF_DATALESS) for name in files)
+    if evicted:
+        raise ValueError(f"{evicted} file del progetto sono solo su iCloud e il servizio non può leggerli")
+    return "tutti i file sono locali"
+
+
+def run_checks(checks) -> list:
+    results = []
+    for label, check in checks:
+        try:
+            results.append((True, label, check()))
+        except Exception as exc:
+            results.append((False, label, str(exc) or type(exc).__name__))
+    return results
+
+
+def format_time(timestamp) -> str:
+    return time.strftime("%d/%m %H:%M", time.localtime(timestamp))
+
+
+def status_report() -> str:
+    lines = [
+        f"{'✅' if ok else '❌'} {label}: {detail}"
+        for ok, label, detail in run_checks([
+            ("Claude", check_claude), ("Output", check_output), ("X/FxTwitter", check_fxtwitter),
+            ("Runtime", check_runtime),
+        ])
+    ]
+    state = read_json(STATE_FILE, {})
+    jobs = queued_jobs()
+    lines.append(f"🕐 Attivo dal {format_time(state.get('started', time.time()))}")
+    lines.append(f"📥 Coda: {len(jobs)} link")
+    for job, _ in jobs:
+        if job["retry_at"] > time.time():
+            lines.append(f"   ↻ {job['url']} alle {format_time(job['retry_at'])}")
+    if state.get("last_success"):
+        lines.append(f"✔️ Ultimo successo {format_time(state['last_success']['time'])}: {state['last_success']['result']}")
+    if state.get("last_failure"):
+        failure = state["last_failure"]
+        lines.append(f"✖️ Ultimo errore {format_time(failure['time'])}: {failure['error'][:300]}")
+    lines.append(f"📄 Log: {LOG_FILE}")
+    return "\n".join(lines)
+
+
+def check_token():
     if not BOT_TOKEN:
-        print(
-            "Error: TELEGRAM_BOT_TOKEN not set.\n"
-            "Create a bot via @BotFather, then:\n"
-            "  export TELEGRAM_BOT_TOKEN='your-token'\n"
-            "or put it in a .env file in the same directory.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+        raise ValueError("TELEGRAM_BOT_TOKEN non configurato")
+    return "configurato"
 
+
+def check_setup() -> bool:
+    """Read-only startup diagnostics; never print the bot token."""
+    results = run_checks([
+        ("Telegram", check_token), ("Claude", check_claude), ("Output", check_output), ("Runtime", check_runtime),
+    ])
+    for ok, label, detail in results:
+        print(f"{'OK ' if ok else 'ERR'} {label}: {detail}", file=sys.stdout if ok else sys.stderr, flush=True)
+    return all(ok for ok, _, _ in results)
+
+
+# ─── watchdog ─────────────────────────────────────────────────────────────────
+
+def network_up() -> bool:
+    try:
+        socket.create_connection(TELEGRAM_ADDRESS, timeout=10).close()
+    except OSError:
+        return False
+    return True
+
+
+def watchdog(bot) -> None:
+    """Report Telegram outages once and restart a process that stays cut off with the network up."""
+    failing_since = error = None
+    connected = False
+    while True:
+        try:
+            bot.get_me()
+        except Exception as exc:
+            failing_since = failing_since or time.time()
+            description = redact(f"{type(exc).__name__}: {exc}")
+            if description != error:
+                error = description
+                log.warning("Telegram unreachable: %s", error)
+            if time.time() - failing_since > STALL_RESTART_SECONDS and network_up():
+                log.critical("Telegram unusable for %d min with the network up: restarting", STALL_RESTART_SECONDS // 60)
+                os._exit(1)
+        else:
+            if failing_since or not connected:
+                log.info("Telegram reachable")
+            failing_since = error = None
+            connected = True
+        time.sleep(WATCHDOG_INTERVAL)
+
+
+# ─── entry points ─────────────────────────────────────────────────────────────
+
+def process_once(url: str) -> int:
+    try:
+        print(pipeline.process({"url": url}))
+    except pipeline.PipelineError as exc:
+        print(f"Errore: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def run_bot() -> None:
     bot = telebot.TeleBot(BOT_TOKEN)
+    wake = threading.Event()
+
+    previous = read_json(STATE_FILE, {})
+    crashed = previous.get("running", False)
+    update_state(running=True, started=time.time())
+
+    def stop(signum, frame):
+        update_state(running=False)
+        log.info("Stopped by signal %d", signum)
+        os._exit(0)
+
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+
+    def remember_owner(msg):
+        if not read_json(STATE_FILE, {}).get("owner_chat_id"):
+            update_state(owner_chat_id=msg.chat.id)
 
     @bot.message_handler(commands=["start", "help"])
     def cmd_help(msg):
-        bot.reply_to(
-            msg,
-            "Hi! Send me an X/Twitter link and I'll extract the prompts automatically.\n\n"
-            "Example:\nhttps://x.com/username/status/123456789",
-        )
+        remember_owner(msg)
+        send(bot, msg.chat.id,
+             "Mandami un link X/Twitter e salvo i prompt in inglese e italiano.\n\n"
+             "Esempio:\nhttps://x.com/username/status/123456789\n\n"
+             "/stato controlla che tutto funzioni.", msg.message_id)
+
+    @bot.message_handler(commands=["stato", "status"])
+    def cmd_status(msg):
+        remember_owner(msg)
+        send(bot, msg.chat.id, status_report(), msg.message_id)
 
     @bot.message_handler(func=lambda msg: True)
     def handle_message(msg):
-        text = (msg.text or "").strip()
-        urls = X_URL_RE.findall(text)
-
+        remember_owner(msg)
+        urls = X_URL_RE.findall((msg.text or "").strip())
         if not urls:
-            bot.reply_to(
-                msg,
-                "No valid X link found. Send a URL like:\nhttps://x.com/.../status/...",
-            )
+            send(bot, msg.chat.id, "Nessun link X valido. Esempio:\nhttps://x.com/.../status/...", msg.message_id)
             return
-
         url = urls[0]
-        bot.reply_to(msg, f"⏳ Processing post...\n{url}")
-
-        output = run_pipeline(url)
-        if output.startswith(("❌", "⏱")):
-            bot.reply_to(msg, output)
+        if enqueue(url, msg.chat.id, msg.message_id):
+            log.info("Queued %s", url)
+            send(bot, msg.chat.id, f"⏳ Ricevuto, in coda ({len(queued_jobs())}).", msg.message_id)
+            wake.set()
         else:
-            bot.reply_to(msg, f"✅ Fatto!\n\n{output}")
+            send(bot, msg.chat.id, "⏳ Questo post è già in coda.", msg.message_id)
 
-    print(f"Bot started. Project: {PROJECT_DIR}")
+    pending = len(queued_jobs())
+    log.info("Bot started. Project: %s. Queue: %d", PROJECT_DIR, pending)
+    for ok, label, detail in run_checks([("Runtime", check_runtime)]):
+        if not ok:
+            log.error("%s: %s", label, detail)
+    if crashed:
+        log.warning("Previous run ended unexpectedly")
+        notify_owner(bot, f"🔄 Il bot è ripartito dopo un arresto imprevisto.\nLink in coda: {pending}.\nLog: {LOG_FILE}")
+    elif pending:
+        notify_owner(bot, f"🔄 Bot avviato: riprendo {pending} link in coda.")
+
+    threading.Thread(target=worker, args=(bot, wake), daemon=True, name="worker").start()
+    threading.Thread(target=watchdog, args=(bot,), daemon=True, name="watchdog").start()
     bot.infinity_polling(timeout=60, long_polling_timeout=30)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--check", action="store_true", help="Verifica configurazione senza avviare il bot")
+    parser.add_argument("--process", metavar="URL", help="Elabora un link senza Telegram")
+    args = parser.parse_args()
+    setup_logging()
+    if args.check:
+        sys.exit(0 if check_setup() else 1)
+    if args.process:
+        sys.exit(process_once(args.process))
+    if not BOT_TOKEN:
+        log.error("TELEGRAM_BOT_TOKEN not set: create a bot via @BotFather and put the token in .env")
+        sys.exit(1)
+    try:
+        run_bot()
+    except Exception:
+        log.exception("Bot crashed")
+        raise
 
 
 if __name__ == "__main__":

@@ -6,6 +6,7 @@
 
 # Image cache
 .img_cache/
+.cache/
 
 # User config (copy config.yaml.example → config.yaml and edit)
 config.yaml
@@ -24,3 +25,6 @@ venv/
 
 # Logs
 *.log
+
+# Listener logs
+logs/

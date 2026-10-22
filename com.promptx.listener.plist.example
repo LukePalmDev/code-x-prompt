@@ -20,7 +20,8 @@
 
   <key>ProgramArguments</key>
   <array>
-    <string>/usr/bin/python3</string>
+    <string>/ABSOLUTE/PATH/TO/code-x-prompt/.venv/bin/python</string>
+    <string>-u</string>
     <string>/ABSOLUTE/PATH/TO/code-x-prompt/prompt-listener.py</string>
   </array>
 
