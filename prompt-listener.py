@@ -239,11 +239,21 @@ def worker(bot, wake: threading.Event) -> None:
 # ─── health checks ────────────────────────────────────────────────────────────
 
 def check_claude():
-    result = subprocess.run(
-        [pipeline.CLAUDE_CMD, "auth", "status"], capture_output=True, text=True,
-        timeout=30, env=pipeline.ENV,
-    )
-    if result.returncode or not json.loads(result.stdout).get("loggedIn"):
+    try:
+        result = subprocess.run(
+            [pipeline.CLAUDE_CMD, "auth", "status"], capture_output=True, text=True,
+            timeout=30, env=pipeline.ENV,
+        )
+    except FileNotFoundError:
+        raise ValueError(
+            "Claude CLI non trovato. Installa con: npm install -g @anthropic-ai/claude-code"
+        ) from None
+    try:
+        status = json.loads(result.stdout or "{}")
+    except ValueError:
+        detail = (result.stderr or result.stdout or "risposta vuota").strip()
+        raise ValueError(f"claude auth status non ha restituito JSON: {detail[:300]}") from None
+    if result.returncode or not status.get("loggedIn"):
         raise ValueError("non autenticato: esegui claude auth login")
     return "autenticato"
 
@@ -274,7 +284,10 @@ def check_runtime():
     evicted = 0
     for root, dirs, files in os.walk(PROJECT_DIR):
         dirs[:] = [name for name in dirs if name != ".git"]
-        evicted += sum(bool(os.lstat(os.path.join(root, name)).st_flags & SF_DATALESS) for name in files)
+        evicted += sum(
+            bool(getattr(os.lstat(os.path.join(root, name)), "st_flags", 0) & SF_DATALESS)
+            for name in files
+        )
     if evicted:
         raise ValueError(f"{evicted} file del progetto sono solo su iCloud e il servizio non può leggerli")
     return "tutti i file sono locali"
