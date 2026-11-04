@@ -135,9 +135,23 @@ def is_transient_error(message: str) -> bool:
 
 
 def output_directory() -> Path:
-    with (PROJECT_DIR / "config.yaml").open() as config_file:
-        config = yaml.safe_load(config_file) or {}
-    directory = Path(config["output_dir"]).expanduser()
+    config_path = PROJECT_DIR / "config.yaml"
+    try:
+        with config_path.open() as config_file:
+            config = yaml.safe_load(config_file) or {}
+    except FileNotFoundError:
+        raise PipelineError(
+            "config.yaml assente. Copialo da config.yaml.example e imposta output_dir.",
+            transient=False,
+        ) from None
+    except OSError as exc:
+        raise PipelineError(f"config.yaml non leggibile: {exc}", transient=True) from exc
+    except yaml.YAMLError as exc:
+        raise PipelineError(f"config.yaml non valido: {exc}", transient=False) from exc
+    raw = config.get("output_dir") if isinstance(config, dict) else None
+    if not isinstance(raw, str) or not raw.strip():
+        raise PipelineError("output_dir mancante in config.yaml.", transient=False)
+    directory = Path(raw).expanduser()
     return directory if directory.is_absolute() else PROJECT_DIR / directory
 
 
@@ -411,9 +425,13 @@ def process(job: dict, save=lambda job: None) -> str:
 
         try:
             root = output_directory()
+            if not root.is_dir():
+                raise PipelineError(f"Cartella output assente: {root}", transient=False)
             existing = sorted(path.name for path in root.iterdir() if path.is_dir())
-        except (OSError, KeyError, yaml.YAMLError) as exc:
-            raise PipelineError(f"Cartella output non accessibile: {exc}", transient=isinstance(exc, OSError))
+        except PipelineError:
+            raise
+        except OSError as exc:
+            raise PipelineError(f"Cartella output non accessibile: {exc}", transient=True) from exc
 
         if "extraction" not in job:
             data = fetch_thread(url)

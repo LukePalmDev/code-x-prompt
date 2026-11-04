@@ -171,6 +171,46 @@ class PipelineTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Cartella topic"):
             pipeline.verify_output("Fatto. 1 prompt in '../Scrittura'.")
 
+    def test_missing_output_folder_is_permanent(self):
+        missing = self.root / "missing"
+        with patch.object(pipeline, "output_directory", lambda: missing):
+            with self.assertRaises(pipeline.PipelineError) as error:
+                pipeline.process({"url": URL})
+        self.assertFalse(error.exception.transient)
+        self.assertIn("assente", str(error.exception))
+
+
+class ConfigTests(unittest.TestCase):
+    def test_missing_config_is_permanent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(pipeline, "PROJECT_DIR", Path(directory)):
+                with self.assertRaises(pipeline.PipelineError) as error:
+                    pipeline.output_directory()
+        self.assertFalse(error.exception.transient)
+        self.assertIn("config.yaml", str(error.exception))
+
+    def test_missing_output_dir_is_permanent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "config.yaml").write_text("other: 1\n")
+            with patch.object(pipeline, "PROJECT_DIR", root):
+                with self.assertRaises(pipeline.PipelineError) as error:
+                    pipeline.output_directory()
+        self.assertFalse(error.exception.transient)
+        self.assertIn("output_dir", str(error.exception))
+
+    def test_output_dir_accepts_relative_absolute_and_home(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = root / "config.yaml"
+            with patch.object(pipeline, "PROJECT_DIR", root):
+                config.write_text('output_dir: "out"\n')
+                self.assertEqual(pipeline.output_directory(), root / "out")
+                config.write_text('output_dir: "/tmp/prompts"\n')
+                self.assertEqual(pipeline.output_directory(), Path("/tmp/prompts"))
+                config.write_text('output_dir: "~/prompts"\n')
+                self.assertEqual(pipeline.output_directory(), Path.home() / "prompts")
+
 
 if __name__ == "__main__":
     unittest.main()

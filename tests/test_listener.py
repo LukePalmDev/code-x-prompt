@@ -134,6 +134,17 @@ class RuntimeTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "1 file .* solo su iCloud"):
                     listener.check_runtime()
 
+    def test_missing_claude_explains_how_to_install(self):
+        with patch.object(listener.subprocess, "run", side_effect=FileNotFoundError(2, "No such file", "claude")):
+            with self.assertRaisesRegex(ValueError, "Claude CLI non trovato"):
+                listener.check_claude()
+
+    def test_non_json_auth_status_is_reported(self):
+        result = subprocess.CompletedProcess([], 0, "not-json", "")
+        with patch.object(listener.subprocess, "run", return_value=result):
+            with self.assertRaisesRegex(ValueError, "non ha restituito JSON"):
+                listener.check_claude()
+
     def test_token_is_redacted_from_errors(self):
         with patch.object(listener, "BOT_TOKEN", "123:secret"):
             self.assertEqual(listener.redact("url /bot123:secret/getMe"), "url /bot***/getMe")

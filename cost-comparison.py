@@ -5,11 +5,12 @@ cost-comparison.py — Show token usage before/after optimization.
 Helps you understand the cost savings from the optimized pipeline.
 """
 
-import json
-
 
 def calculate_costs():
     """Calculate and display token costs for before/after scenarios."""
+    print("These figures are estimates for the retired direct-API experiment.")
+    print("Current command: .venv/bin/python prompt-listener.py --process <url>")
+    print()
 
     # Realistic costs based on typical X prompt posts
     scenarios = [
@@ -158,7 +159,7 @@ def calculate_costs():
     print()
     print("=" * 80)
     print()
-    print("✅ To deploy: pip install -r requirements.txt && python3 optimize-pipeline.py <url>")
+    print("Current command: .venv/bin/python prompt-listener.py --process <url>")
     print()
 
 

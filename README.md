@@ -42,22 +42,31 @@ prompt-x-output/
 - **Python 3.9+** for the minimal bot; **3.11+** for all optional dependencies
 - **[Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code)** — `npm install -g @anthropic-ai/claude-code`
 - An **X (Twitter) account** only if the optional authenticated fallback is needed
-- A **Telegram bot token** from [@BotFather](https://t.me/BotFather) *(optional — you can also run the pipeline manually)*
+- A **Telegram bot token** from [@BotFather](https://t.me/BotFather) *(only to run the bot — the pipeline can also be run manually)*
+
+## Environment
+
+| Name | Required | Where |
+|------|----------|--------|
+| `TELEGRAM_BOT_TOKEN` | Bot only | `.env`, copied from `.env.example`. Do not commit `.env`. |
+| `output_dir` | Always | `config.yaml`, copied from `config.yaml.example`. This is not an environment variable. |
+
+Claude Code must be logged in (`claude auth login`). The default fetch uses the public FxTwitter API and needs no X API key, bearer token, or cookie. `twscrape` reads browser cookies only when that package is installed and the public fetch fails.
 
 ## Setup
 
 ### 1. Clone and install
 
 ```bash
-git clone https://github.com/your-username/code-x-prompt.git
+git clone https://github.com/LukePalmDev/code-x-prompt.git
 cd code-x-prompt
 python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements-bot.txt
 ```
 
-`requirements-bot.txt` installs only the dependencies needed by the current
-listener and public fetch workflow. `requirements.txt` also includes the optional
-authenticated fallback and experimental OCR/API pipeline.
+`requirements-bot.txt` installs only the dependencies needed by the listener
+and the public fetch. `requirements.txt` adds the optional `twscrape` fallback
+(`twscrape`, `browser-cookie3`).
 
 ### 2. Configure the output directory
 
@@ -209,6 +218,7 @@ Inside a Claude Code session, pasting an X link makes Claude run this command
 | `com.promptx.listener.plist.example` | macOS launchd template for auto-start |
 | `install-service.py` | Generates and optionally installs the LaunchAgent |
 | `requirements-bot.txt` | Minimal listener dependencies |
+| `optimize-pipeline.py` | Same pipeline as `--process` |
 
 ## Configuration reference
 
