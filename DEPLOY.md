@@ -14,6 +14,8 @@ claude auth login
 .venv/bin/python install-service.py --install
 ```
 
+`provider` stays Claude until the service clone's `config.yaml` sets `ollama`. Installing or updating this revision does not edit that file and does not call Ollama. Do that switch only after `prompt-listener.py --smoke-provider` has been accepted on the mini. That command cannot send Telegram.
+
 After pushing new code, update the service clone with:
 
 ```bash

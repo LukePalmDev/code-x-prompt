@@ -2,9 +2,11 @@
 pipeline.py — turn an X post into bilingual prompt files.
 
 Python owns every deterministic step: fetching, folder choice, duplicates,
-numbering, writing and verification. Claude only extracts and translates the
-prompts, with tools disabled and a fixed JSON schema, so it cannot touch the
-filesystem or claim work it did not do.
+numbering, writing and verification. The model only extracts and translates
+the prompts. Claude Code is the default: tools disabled, fixed JSON schema,
+no filesystem access. Optional local Ollama uses the same schema and the same
+validation, and a failure there never calls Claude. Retrieval stays FxTwitter
+with the optional twscrape fallback.
 """
 
 import asyncio
@@ -17,10 +19,15 @@ import logging
 import os
 import re
 import shutil
+import socket
 import subprocess
 import tempfile
+import threading
 import time
 import unicodedata
+import urllib.error
+import urllib.parse
+import urllib.request
 from pathlib import Path
 
 import yaml
@@ -52,6 +59,40 @@ FALLBACK_MODEL = "sonnet"
 MAX_EXTRACTION_ATTEMPTS = 3
 RETRY_DELAYS = (5, 15)
 CLAUDE_TIMEOUT = 600
+# Local generation only. These bounds are per request; nothing here changes the
+# Ollama server, its environment, or which models are installed.
+# On the Mac mini M4 with 16GB, gemma4:12b-it-q4_K_M at num_ctx 4096 left about
+# 14% RAM free while Trader was already sharing that server and tag. The model
+# card context (262144) is refused below.
+OLLAMA_DEFAULT_BASE = "http://127.0.0.1:11434"
+OLLAMA_NUM_CTX_DEFAULT = 4096
+OLLAMA_NUM_CTX_MIN = 2048
+OLLAMA_NUM_CTX_MAX = 8192
+# Model-card context observed for the local tag. Never sent: on 16GB it would
+# exhaust the memory the shared Ollama server still has at num_ctx 4096.
+OLLAMA_MODEL_CONTEXT_REFUSAL = 262144
+OLLAMA_NUM_PREDICT_DEFAULT = 2048
+OLLAMA_NUM_PREDICT_MIN = 256
+OLLAMA_NUM_PREDICT_MAX = 3584
+OLLAMA_TIMEOUT_DEFAULT = 240
+OLLAMA_TIMEOUT_MIN = 30
+OLLAMA_TIMEOUT_MAX = 600
+OLLAMA_KEEP_ALIVE_DEFAULT = "5m"
+OLLAMA_RETRY_DELAYS = (5, 20)
+OLLAMA_MAX_RESPONSE_BYTES = 1_000_000
+# Over-estimate tokens (3 characters each) so a post that may not fit is
+# rejected instead of being truncated inside the context window.
+OLLAMA_CHARS_PER_TOKEN = 3
+OLLAMA_TEMPLATE_TOKENS = 128
+_OLLAMA_LOCK = threading.Lock()
+_MODEL_TAG = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$")
+_KEEP_ALIVE = re.compile(r"^([1-9]\d*)([smh])$")
+_LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
+# Fixed innocuous text for --smoke-provider. No network and no output files.
+SMOKE_THREAD = (
+    "Local extraction check.\n\n"
+    "Prompt: Write a two-sentence thank-you note to [name] for help with {task}."
+)
 TRANSIENT_ERROR_MARKERS = (
     "connection closed",
     "connection error",
@@ -134,25 +175,175 @@ def is_transient_error(message: str) -> bool:
     return any(marker in normalized for marker in TRANSIENT_ERROR_MARKERS)
 
 
-def output_directory() -> Path:
+def read_config_file():
+    """Return the config mapping, or None when config.yaml is absent.
+
+    An empty file is an empty mapping. Invalid YAML is a permanent error.
+    """
     config_path = PROJECT_DIR / "config.yaml"
     try:
-        with config_path.open() as config_file:
-            config = yaml.safe_load(config_file) or {}
+        handle = config_path.open()
     except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise PipelineError(f"config.yaml non leggibile: {exc}", transient=True) from exc
+    with handle:
+        try:
+            config = yaml.safe_load(handle)
+        except yaml.YAMLError as exc:
+            raise PipelineError(f"config.yaml non valido: {exc}", transient=False) from exc
+    if config is None:
+        return {}
+    if not isinstance(config, dict):
+        raise PipelineError("config.yaml deve essere un mapping.", transient=False)
+    return config
+
+
+def output_directory() -> Path:
+    config = read_config_file()
+    if config is None:
         raise PipelineError(
             "config.yaml assente. Copialo da config.yaml.example e imposta output_dir.",
             transient=False,
-        ) from None
-    except OSError as exc:
-        raise PipelineError(f"config.yaml non leggibile: {exc}", transient=True) from exc
-    except yaml.YAMLError as exc:
-        raise PipelineError(f"config.yaml non valido: {exc}", transient=False) from exc
-    raw = config.get("output_dir") if isinstance(config, dict) else None
+        )
+    raw = config.get("output_dir")
     if not isinstance(raw, str) or not raw.strip():
         raise PipelineError("output_dir mancante in config.yaml.", transient=False)
     directory = Path(raw).expanduser()
     return directory if directory.is_absolute() else PROJECT_DIR / directory
+
+
+def _bounded_int(value, name: str, default: int, low: int, high: int) -> int:
+    if value is None:
+        return default
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise PipelineError(f"{name} deve essere un intero fra {low} e {high}.", transient=False)
+    if not low <= value <= high:
+        extra = ""
+        if name == "ollama.num_ctx":
+            extra = f" Il contesto di scheda {OLLAMA_MODEL_CONTEXT_REFUSAL} non viene mai inviato."
+        raise PipelineError(
+            f"{name}={value} non è accettato (minimo {low}, massimo {high}).{extra}",
+            transient=False,
+        )
+    return value
+
+
+def _keep_alive(value) -> str:
+    if value is None:
+        return OLLAMA_KEEP_ALIVE_DEFAULT
+    if isinstance(value, bool):
+        raise PipelineError("ollama.keep_alive non è un booleano.", transient=False)
+    if isinstance(value, int):
+        if not 30 <= value <= 1800:
+            raise PipelineError(
+                "ollama.keep_alive in secondi deve essere fra 30 e 1800. "
+                "0 scaricherebbe il modello condiviso con Trader e non è accettato.",
+                transient=False,
+            )
+        return f"{value}s"
+    if not isinstance(value, str) or not _KEEP_ALIVE.fullmatch(value.strip()):
+        raise PipelineError(
+            "ollama.keep_alive deve essere una durata positiva, per esempio 5m. "
+            "0 non è accettato: scaricherebbe il modello già usato da Trader.",
+            transient=False,
+        )
+    amount, unit = _KEEP_ALIVE.fullmatch(value.strip()).groups()
+    seconds = int(amount) * {"s": 1, "m": 60, "h": 3600}[unit]
+    if not 30 <= seconds <= 1800:
+        raise PipelineError("ollama.keep_alive deve durare fra 30 secondi e 30 minuti.", transient=False)
+    return value.strip()
+
+
+def _ollama_base_url(value) -> str:
+    raw = OLLAMA_DEFAULT_BASE if value is None else value
+    if not isinstance(raw, str) or not raw.strip():
+        raise PipelineError("ollama.base_url deve essere un URL http locale.", transient=False)
+    parsed = urllib.parse.urlparse(raw.strip())
+    host = (parsed.hostname or "").lower()
+    if parsed.scheme != "http" or host not in _LOOPBACK_HOSTS:
+        raise PipelineError(
+            "ollama.base_url deve essere http su localhost "
+            f"(predefinito {OLLAMA_DEFAULT_BASE}). Un host remoto non è un provider locale.",
+            transient=False,
+        )
+    if parsed.username or parsed.password or parsed.query or parsed.fragment or parsed.path not in ("", "/"):
+        raise PipelineError("ollama.base_url non deve avere credenziali, path, query o fragment.", transient=False)
+    return raw.strip().rstrip("/")
+
+
+def _ollama_block(block) -> dict:
+    if block is None:
+        block = {}
+    if not isinstance(block, dict):
+        raise PipelineError("ollama in config.yaml deve essere un mapping.", transient=False)
+    model = block.get("model")
+    if not isinstance(model, str) or not _MODEL_TAG.fullmatch(model) or ".." in model:
+        raise PipelineError(
+            "Con provider ollama serve ollama.model: il tag esatto già installato "
+            "(quello di `ollama list`). Nessun tag è predefinito e nessun modello viene scaricato.",
+            transient=False,
+        )
+    think = block.get("think", False)
+    if not isinstance(think, bool):
+        raise PipelineError(
+            "ollama.think deve essere true o false. Se la chiave manca si invia comunque false: "
+            "ommettere il campo think farebbe usare il default del modello, e per il tag locale "
+            "verificato il thinking è attivo.",
+            transient=False,
+        )
+    temperature = block.get("temperature", 0)
+    if isinstance(temperature, bool) or not isinstance(temperature, (int, float)) or not 0 <= float(temperature) <= 1:
+        raise PipelineError("ollama.temperature deve essere un numero fra 0 e 1.", transient=False)
+    num_ctx = _bounded_int(block.get("num_ctx"), "ollama.num_ctx", OLLAMA_NUM_CTX_DEFAULT, OLLAMA_NUM_CTX_MIN, OLLAMA_NUM_CTX_MAX)
+    num_predict = _bounded_int(
+        block.get("num_predict"), "ollama.num_predict",
+        OLLAMA_NUM_PREDICT_DEFAULT, OLLAMA_NUM_PREDICT_MIN, OLLAMA_NUM_PREDICT_MAX,
+    )
+    if num_predict > num_ctx - 512:
+        raise PipelineError(
+            f"ollama.num_predict={num_predict} non lascia almeno 512 token di input in num_ctx={num_ctx}.",
+            transient=False,
+        )
+    if num_ctx > OLLAMA_NUM_CTX_DEFAULT:
+        log.warning(
+            "ollama.num_ctx=%s is above the measured %s on a 16GB Mac mini sharing this model",
+            num_ctx, OLLAMA_NUM_CTX_DEFAULT,
+        )
+    return {
+        "provider": "ollama",
+        "base_url": _ollama_base_url(block.get("base_url")),
+        "model": model,
+        "timeout_seconds": _bounded_int(
+            block.get("timeout_seconds"), "ollama.timeout_seconds",
+            OLLAMA_TIMEOUT_DEFAULT, OLLAMA_TIMEOUT_MIN, OLLAMA_TIMEOUT_MAX,
+        ),
+        "num_ctx": num_ctx,
+        "num_predict": num_predict,
+        "temperature": float(temperature),
+        "think": think,
+        "keep_alive": _keep_alive(block.get("keep_alive")),
+    }
+
+
+def provider_settings() -> dict:
+    """Claude unless config.yaml sets provider to ollama. Extra keys are ignored."""
+    config = read_config_file() or {}
+    raw = config.get("provider", "claude")
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        raw = "claude"
+    if not isinstance(raw, str):
+        raise PipelineError("provider in config.yaml deve essere una stringa.", transient=False)
+    provider = raw.strip().lower()
+    if provider == "claude":
+        return {"provider": "claude"}
+    if provider == "ollama":
+        return _ollama_block(config.get("ollama"))
+    raise PipelineError(
+        f"provider '{provider}' non supportato. Usa claude (predefinito) oppure ollama. "
+        "Non esiste un fallback silenzioso fra i due.",
+        transient=False,
+    )
 
 
 def configured_model() -> str:
@@ -281,12 +472,221 @@ def validate_extraction(extraction) -> dict:
     return extraction
 
 
-def run_claude(source: str, existing: list, model: str) -> dict:
-    """One extraction call; raises PipelineError on any failure."""
-    request = (
+def extraction_request(source: str, existing: list) -> str:
+    return (
         f"Cartelle esistenti: {', '.join(existing) or 'nessuna'}\n\n"
         f"Post e thread X:\n\n{source}"
     )
+
+
+def _estimate_tokens(text: str) -> int:
+    return max(1, (len(text) + OLLAMA_CHARS_PER_TOKEN - 1) // OLLAMA_CHARS_PER_TOKEN)
+
+
+def _clip(text: str, limit: int = 400) -> str:
+    text = " ".join(str(text).split())
+    return text if len(text) <= limit else text[:limit] + "…"
+
+
+def assert_ollama_context(source: str, existing: list, settings: dict) -> None:
+    """Reject a post that cannot fit. Never truncate it to the context window."""
+    incoming = _estimate_tokens(SYSTEM_PROMPT) + _estimate_tokens(extraction_request(source, existing))
+    incoming += OLLAMA_TEMPLATE_TOKENS
+    room = settings["num_ctx"] - settings["num_predict"]
+    if incoming <= room:
+        return
+    raise PipelineError(
+        f"Il testo non entra in num_ctx={settings['num_ctx']} con num_predict={settings['num_predict']} "
+        f"(stima {incoming} token di input, spazio {room}). "
+        "Nessun troncamento e nessun fallback su Claude. "
+        f"Accorcia il thread oppure alza num_ctx fino a {OLLAMA_NUM_CTX_MAX}, "
+        f"mai fino a {OLLAMA_MODEL_CONTEXT_REFUSAL}.",
+        transient=False,
+    )
+
+
+def ollama_chat_body(source: str, existing: list, settings: dict) -> dict:
+    """POST /api/chat body. tools is omitted on purpose; format carries the schema."""
+    return {
+        "model": settings["model"],
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": extraction_request(source, existing)},
+        ],
+        "stream": False,
+        "think": settings["think"],
+        "format": EXTRACTION_SCHEMA,
+        "keep_alive": settings["keep_alive"],
+        "options": {
+            "temperature": settings["temperature"],
+            "num_ctx": settings["num_ctx"],
+            "num_predict": settings["num_predict"],
+        },
+    }
+
+
+def ollama_http(settings: dict, method: str, path: str, payload=None, timeout: int = None) -> dict:
+    url = settings["base_url"] + path
+    data = None
+    headers = {"Accept": "application/json"}
+    if payload is not None:
+        data = json.dumps(payload).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    request = urllib.request.Request(url, data=data, headers=headers, method=method)
+    limit = settings["timeout_seconds"] if timeout is None else timeout
+    try:
+        with urllib.request.urlopen(request, timeout=limit) as response:
+            raw = response.read(OLLAMA_MAX_RESPONSE_BYTES + 1)
+    except urllib.error.HTTPError as exc:
+        detail = _clip(exc.read(2000).decode("utf-8", "replace") or exc.reason)
+        lowered = detail.lower()
+        transient = exc.code in (408, 429, 500, 502, 503, 504) or is_transient_error(lowered)
+        if any(marker in lowered for marker in ("out of memory", "cannot allocate", "model is loading", "server busy", "runner")):
+            transient = True
+        if exc.code in (400, 404) or any(marker in lowered for marker in ("not found", "invalid format", "unknown field", "does not support")):
+            transient = False
+        raise PipelineError(
+            f"Ollama HTTP {exc.code} su {path}: {detail}. Nessun fallback su Claude.",
+            transient=transient,
+        ) from exc
+    except (TimeoutError, socket.timeout) as exc:
+        raise PipelineError(
+            f"Ollama non ha risposto entro {limit}s su {settings['base_url']}. Nessun fallback su Claude.",
+            transient=True,
+        ) from exc
+    except urllib.error.URLError as exc:
+        timed_out = isinstance(exc.reason, (TimeoutError, socket.timeout))
+        if timed_out:
+            message = f"Ollama non ha risposto entro {limit}s su {settings['base_url']}."
+        else:
+            message = f"Ollama non raggiungibile su {settings['base_url']}: {exc.reason}"
+        raise PipelineError(f"{message} Nessun fallback su Claude.", transient=True) from exc
+    if len(raw) > OLLAMA_MAX_RESPONSE_BYTES:
+        raise PipelineError("Risposta Ollama troppo grande.", transient=False)
+    try:
+        parsed = json.loads(raw.decode("utf-8"))
+    except ValueError as exc:
+        raise PipelineError("Ollama ha restituito un corpo che non è JSON.", transient=True) from exc
+    if not isinstance(parsed, dict):
+        raise PipelineError("Ollama ha restituito un JSON inatteso.", transient=True)
+    return parsed
+
+
+def parse_structured_text(content: str) -> dict:
+    text = content.strip()
+    fence = re.search(r"```(?:json)?\s*(.*?)```", text, re.DOTALL)
+    if fence:
+        text = fence.group(1).strip()
+    try:
+        parsed = json.loads(text)
+    except ValueError:
+        start, end = text.find("{"), text.rfind("}")
+        if start < 0 or end <= start:
+            raise ValueError("JSON assente.")
+        try:
+            parsed = json.loads(text[start:end + 1])
+        except ValueError as exc:
+            raise ValueError("JSON non parsabile.") from exc
+    return validate_extraction(parsed)
+
+
+def parse_ollama_chat(payload: dict, settings: dict) -> dict:
+    message = payload.get("message")
+    if not isinstance(message, dict):
+        raise ValueError("message assente.")
+    if message.get("tool_calls"):
+        raise ValueError("tool_calls presenti; la richiesta non invia tools.")
+    if payload.get("done_reason") == "length":
+        raise ValueError(f"generazione interrotta da num_predict={settings['num_predict']}.")
+    evaluated = payload.get("prompt_eval_count")
+    if isinstance(evaluated, int) and evaluated >= settings["num_ctx"]:
+        raise ValueError(f"prompt_eval_count={evaluated} ha riempito num_ctx={settings['num_ctx']}.")
+    content = message.get("content")
+    if not isinstance(content, str) or not content.strip():
+        if message.get("thinking"):
+            raise ValueError("solo thinking e nessun JSON; ollama.think deve restare false.")
+        raise ValueError("contenuto vuoto.")
+    return parse_structured_text(content)
+
+
+def run_ollama(source: str, existing: list, settings: dict) -> dict:
+    """One local extraction. The lock keeps this process to a single Ollama call."""
+    body = ollama_chat_body(source, existing, settings)
+    with _OLLAMA_LOCK:
+        payload = ollama_http(settings, "POST", "/api/chat", body)
+    try:
+        return parse_ollama_chat(payload, settings)
+    except ValueError as exc:
+        raise PipelineError(f"Risposta di Ollama non valida: {exc}", transient=True) from exc
+
+
+def extract_with_ollama(source: str, existing: list, settings: dict) -> dict:
+    assert_ollama_context(source, existing, settings)
+    for attempt in range(1, MAX_EXTRACTION_ATTEMPTS + 1):
+        try:
+            extraction = run_ollama(source, existing, settings)
+        except PipelineError as exc:
+            log.warning(
+                "Ollama attempt %d/%d (%s, num_ctx=%s) failed: %s",
+                attempt, MAX_EXTRACTION_ATTEMPTS, settings["model"], settings["num_ctx"], exc,
+            )
+            if not exc.transient or attempt == MAX_EXTRACTION_ATTEMPTS:
+                if exc.transient and attempt == MAX_EXTRACTION_ATTEMPTS and "non valida" in str(exc):
+                    raise PipelineError(str(exc), transient=False) from exc
+                raise
+            time.sleep(OLLAMA_RETRY_DELAYS[attempt - 1])
+        else:
+            log.info(
+                "Extracted %d prompts with ollama model %s (num_ctx=%s, think=%s)",
+                len(extraction["prompts"]), settings["model"], settings["num_ctx"], settings["think"],
+            )
+            return extraction
+
+
+def check_ollama(settings: dict = None) -> str:
+    """GET /api/tags only. Does not generate, pull a model, or call Claude."""
+    settings = settings or provider_settings()
+    if settings.get("provider") != "ollama":
+        raise PipelineError("provider non è ollama.", transient=False)
+    payload = ollama_http(settings, "GET", "/api/tags", timeout=10)
+    names = []
+    for model in payload.get("models") or []:
+        if not isinstance(model, dict):
+            continue
+        for key in ("name", "model"):
+            value = model.get(key)
+            if isinstance(value, str) and value not in names:
+                names.append(value)
+    tag = settings["model"]
+    if tag not in names:
+        shown = ", ".join(names[:8]) or "nessuno"
+        raise PipelineError(
+            f"tag '{tag}' assente in GET /api/tags ({shown}). "
+            "Imposta ollama.model con un tag già installato. Nessun modello viene scaricato.",
+            transient=False,
+        )
+    return f"locale {settings['base_url']}, modello {tag}, num_ctx {settings['num_ctx']}, think {str(settings['think']).lower()}"
+
+
+def smoke_local_extraction() -> dict:
+    """One bounded local extraction. No fetch, no files, no Telegram.
+
+    Waits on the pipeline lock so it does not run beside another PromptX job.
+    It cannot see Trader's requests; Ollama queues those on the shared server.
+    """
+    settings = provider_settings()
+    if settings["provider"] != "ollama":
+        raise PipelineError("provider claude: smoke locale non eseguito.", transient=False)
+    with exclusive_lock():
+        extraction = extract_with_ollama(SMOKE_THREAD, [], settings)
+    if not extraction["prompts"]:
+        raise PipelineError("Smoke Ollama senza prompt.", transient=False)
+    return extraction
+
+
+def run_claude(source: str, existing: list, model: str) -> dict:
+    """One extraction call; raises PipelineError on any failure."""
+    request = extraction_request(source, existing)
     command = [
         CLAUDE_CMD, "-p", request,
         "--model", model,
@@ -327,7 +727,7 @@ def run_claude(source: str, existing: list, model: str) -> dict:
         raise PipelineError(f"Risposta di Claude non valida: {exc}", transient=True)
 
 
-def extract_prompts(source: str, existing: list) -> dict:
+def extract_with_claude(source: str, existing: list) -> dict:
     models = [configured_model()] + [FALLBACK_MODEL] * (MAX_EXTRACTION_ATTEMPTS - 1)
     for attempt, model in enumerate(models, 1):
         try:
@@ -340,6 +740,13 @@ def extract_prompts(source: str, existing: list) -> dict:
         else:
             log.info("Extracted %d prompts with %s", len(extraction["prompts"]), model)
             return extraction
+
+
+def extract_prompts(source: str, existing: list) -> dict:
+    settings = provider_settings()
+    if settings["provider"] == "ollama":
+        return extract_with_ollama(source, existing, settings)
+    return extract_with_claude(source, existing)
 
 
 def report_non_verbatim(source: str, prompts: list) -> None:

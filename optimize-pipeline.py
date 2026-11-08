@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Run the maintained prompt pipeline for one X post URL.
 
-Same work as `prompt-listener.py --process`: fetch the public thread, ask
-Claude Code once, and write bilingual files. Existing complete files are kept.
+Same work as `prompt-listener.py --process`: fetch the public thread, ask the
+configured provider once (Claude Code unless config.yaml selects Ollama), and
+write bilingual files. Existing complete files are kept.
 """
 
 import sys

@@ -14,12 +14,14 @@ cp config.yaml.example config.yaml
 
 Edit `config.yaml` and set `output_dir` to a folder that already exists.
 
-Log in to Claude Code:
+Log in to Claude Code (this is still the default provider):
 
 ```bash
 npm install -g @anthropic-ai/claude-code
 claude auth login
 ```
+
+A local Ollama provider is optional and off until `config.yaml` sets `provider: ollama`. See [README.md](README.md) for the verified tag, the `num_ctx` limit, and the no-Telegram smoke command. Do not switch the service config until that smoke has been run on the mini.
 
 ## Run one post
 

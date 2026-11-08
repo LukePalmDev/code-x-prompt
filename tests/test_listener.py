@@ -19,6 +19,26 @@ spec.loader.exec_module(listener)
 URL = "https://x.com/author/status/123"
 
 
+class _Tags:
+    """Minimal response for a mocked Ollama GET /api/tags."""
+
+    def __init__(self, raw: bytes):
+        self.raw = raw
+
+    def read(self, n=-1):
+        if n is None or n < 0 or n >= len(self.raw):
+            data, self.raw = self.raw, b""
+            return data
+        data, self.raw = self.raw[:n], self.raw[n:]
+        return data
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+
 class QueueTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -110,6 +130,51 @@ class QueueTests(unittest.TestCase):
         with patch.object(listener, "BOT_TOKEN", "test"), patch.object(listener.subprocess, "run", return_value=result), \
                 patch.object(listener, "check_output", return_value="ok"):
             self.assertFalse(listener.check_setup())
+
+    def test_setup_check_ollama_does_not_call_claude_or_telegram(self):
+        settings = {
+            "provider": "ollama",
+            "base_url": "http://127.0.0.1:11434",
+            "model": "gemma4:12b-it-q4_K_M",
+            "timeout_seconds": 30,
+            "num_ctx": 4096,
+            "num_predict": 2048,
+            "temperature": 0.0,
+            "think": False,
+            "keep_alive": "5m",
+        }
+
+        def urlopen(request, timeout=None):
+            self.assertEqual(request.get_method(), "GET")
+            self.assertTrue(request.full_url.endswith("/api/tags"))
+            self.assertEqual(timeout, 10)
+            body = json.dumps({"models": [{"name": "gemma4:12b-it-q4_K_M"}]}).encode()
+            return _Tags(body)
+
+        with patch.object(listener, "BOT_TOKEN", "test"), \
+                patch.object(listener.pipeline, "provider_settings", return_value=settings), \
+                patch.object(listener.pipeline.urllib.request, "urlopen", side_effect=urlopen), \
+                patch.object(listener, "check_output", return_value="ok"), \
+                patch.object(listener.subprocess, "run", side_effect=AssertionError("claude")), \
+                patch.object(listener.telebot, "TeleBot", side_effect=AssertionError("telegram")):
+            self.assertTrue(listener.check_setup())
+
+    def test_smoke_on_claude_does_not_call_claude_telegram_or_ollama(self):
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(listener.pipeline, "PROJECT_DIR", Path(directory)), \
+                patch.object(listener.telebot, "TeleBot", side_effect=AssertionError("telegram")), \
+                patch.object(listener.subprocess, "run", side_effect=AssertionError("claude")), \
+                patch.object(listener.pipeline.urllib.request, "urlopen", side_effect=AssertionError("ollama")):
+            self.assertEqual(listener.smoke_provider(), 2)
+
+    def test_smoke_ollama_does_not_construct_telegram(self):
+        settings = {"provider": "ollama", "model": "gemma4:12b-it-q4_K_M", "num_ctx": 4096, "think": False}
+        extraction = {"topic": "Nota", "prompts": [{"title_en": "t"}]}
+        with patch.object(listener.pipeline, "provider_settings", return_value=settings), \
+                patch.object(listener.pipeline, "smoke_local_extraction", return_value=extraction) as smoke, \
+                patch.object(listener.telebot, "TeleBot", side_effect=AssertionError("telegram")):
+            self.assertEqual(listener.smoke_provider(), 0)
+        smoke.assert_called_once_with()
 
 
 class RuntimeTests(unittest.TestCase):

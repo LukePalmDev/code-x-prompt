@@ -5,7 +5,8 @@
 - The fetch uses the public FxTwitter API. Images are not downloaded on this path.
 - A post already recorded in `.cache/processed.json` does not call Claude again.
 - Complete prompt files are never overwritten.
-- The model comes from `.claude/settings.json`, with Sonnet as the fallback.
+- The default model comes from `.claude/settings.json`, with Sonnet as the fallback inside Claude only.
+- `provider: ollama` is optional. It uses the same JSON schema, sends an explicit `num_ctx`, and does not fall back to Claude. See [README.md](README.md).
 
 `cost-comparison.py` prints token estimates from an older direct-API experiment. Those numbers are not a measurement of the current pipeline.
 

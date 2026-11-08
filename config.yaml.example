@@ -10,3 +10,31 @@
 #   /Users/you/Library/Mobile Documents/com~apple~CloudDocs/prompts   (iCloud)
 #   /Volumes/MyDrive/prompts
 output_dir: "~/Documents/prompt-x-output"
+
+# Optional local provider. Leave this block commented: an absent `provider`
+# keeps Claude Code, including on the running service. Uncomment only after
+# the local smoke below has been reviewed. There is no silent fallback: with
+# `provider: ollama` a failure never calls Claude, and Claude never calls Ollama.
+#
+# Do not pull another model. `model` must be a tag already returned by
+# `ollama list`. The tag below is the one verified on the Mac mini
+# (gemma4:12b-it-q4_K_M, 8.0GB, Q4_K_M) at Ollama 0.40.14 on
+# http://127.0.0.1:11434. It is not a code default.
+#
+# num_ctx is sent on every request. 4096 is the measured point (about 14% RAM
+# free on 16GB while this model is loaded). The maximum accepted is 8192.
+# Do not set the model-card context 262144. think false is sent explicitly
+# because this model's thinking default is on; the field is the documented
+# POST /api/chat `think` boolean. keep_alive must not be 0: that would unload
+# the model shared with Trader. This file does not change the Ollama service.
+#
+# provider: ollama
+# ollama:
+#   base_url: "http://127.0.0.1:11434"
+#   model: "gemma4:12b-it-q4_K_M"
+#   timeout_seconds: 240
+#   num_ctx: 4096
+#   num_predict: 2048
+#   temperature: 0
+#   think: false
+#   keep_alive: "5m"
