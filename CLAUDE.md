@@ -45,7 +45,15 @@ Regole garantite dal codice in `pipeline.py`:
 - i file completi non vengono mai sovrascritti;
 - successo solo dopo la verifica dei file in entrambe le lingue (i file iCloud
   solo-cloud sono verificati per dimensione);
-- modello Claude: quello di `.claude/settings.json`, poi Sonnet come riserva;
+- modello Claude: `claude-sonnet-5-5` (Sonnet 5.5; la CLI 2.1.317 accetta
+  `--effort medium`). `CLAUDE_CODE_EFFORT_LEVEL` sovrascrive il flag ed è
+  impostato solo sul processo figlio. Niente Haiku e niente `--fallback-model`.
+  Il thinking di Sonnet 5.5 non si disabilita. `.claude/settings.json` non
+  sceglie il modello della pipeline;
+- una quota esaurita non viene ritentata. Il reset settimanale segnalato è
+  06:00 Europe/Rome, non una finestra di 5 ore. La percentuale 5h si mostra solo
+  se il JSON della CLI la contiene già; token e `total_cost_usd` non diventano
+  una percentuale;
 - provider predefinito: Claude. `provider: ollama` è opt-in nel `config.yaml`
   del clone di servizio e non va attivato finché `--smoke-provider` non è
   stato accettato sulla mini. Il tag non è implicito: l'esempio verificato è

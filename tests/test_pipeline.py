@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -40,7 +41,6 @@ class PipelineTests(unittest.TestCase):
             ("PROCESSED_INDEX", cache / "processed.json"),
             ("LOCK_FILE", cache / "pipeline.lock"),
             ("CLAUDE_WORKDIR", Path(self.temp.name) / "work"),
-            ("configured_model", lambda: "claude-haiku-test"),
             ("fetch_thread", lambda url: {"author": "some_author", "tweet_text": "Thread intro", "thread": []}),
             # Injected provider: a service config.yaml that selects Ollama must not leak in.
             ("provider_settings", lambda: {"provider": "claude"}),
@@ -83,21 +83,31 @@ class PipelineTests(unittest.TestCase):
         command = run.call_args.args[0]
         self.assertEqual(command[command.index("--tools") + 1], "")
         self.assertIn("--json-schema", command)
-        self.assertEqual(command[command.index("--model") + 1], "claude-haiku-test")
-        self.assertEqual(command[command.index("--fallback-model") + 1], "sonnet")
+        self.assertEqual(command[command.index("--model") + 1], pipeline.CLAUDE_SONNET_MODEL)
+        self.assertEqual(command[command.index("--effort") + 1], "medium")
+        self.assertNotIn("--fallback-model", command)
+        self.assertEqual(run.call_args.kwargs["env"]["CLAUDE_CODE_EFFORT_LEVEL"], "medium")
+        self.assertIsNot(run.call_args.kwargs["env"], os.environ)
+        self.assertNotIn("CLAUDE_CODE_EFFORT_LEVEL", os.environ)
         self.assertNotEqual(run.call_args.kwargs["cwd"], pipeline.PROJECT_DIR)
 
-    def test_invalid_answer_retries_with_fallback_model(self):
+    def test_invalid_answer_retries_the_same_model(self):
         _, run = self.run_process(claude_result(None), claude_result(extraction()))
-        command = run.call_args.args[0]
-        self.assertEqual(command[command.index("--model") + 1], "sonnet")
-        self.assertNotIn("--fallback-model", command)
-
-    def test_retired_model_uses_fallback_model(self):
-        retired = claude_result(result="There's an issue with the selected model (old). It may not exist.", is_error=True)
-        output, run = self.run_process(retired, claude_result(extraction()))
-        self.assertTrue(output.startswith("Fatto."))
         self.assertEqual(run.call_count, 2)
+        for call in run.call_args_list:
+            command = call.args[0]
+            self.assertEqual(command[command.index("--model") + 1], pipeline.CLAUDE_SONNET_MODEL)
+            self.assertNotIn("--fallback-model", command)
+            self.assertNotIn("haiku", command)
+
+    def test_retired_model_is_not_switched(self):
+        retired = claude_result(result="There's an issue with the selected model (old). It may not exist.", is_error=True)
+        with patch.object(pipeline.subprocess, "run", side_effect=[retired, claude_result(extraction())]) as run:
+            with self.assertRaises(pipeline.PipelineError) as error:
+                pipeline.process({"url": URL})
+        self.assertFalse(error.exception.transient)
+        self.assertEqual(run.call_count, 1)
+        self.assertNotIn("--fallback-model", run.call_args.args[0])
 
     def test_auth_error_is_permanent(self):
         with self.assertRaises(pipeline.PipelineError) as error:

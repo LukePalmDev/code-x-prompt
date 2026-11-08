@@ -173,6 +173,20 @@ class QueueTests(unittest.TestCase):
                 patch.object(listener.pipeline.urllib.request, "urlopen", side_effect=AssertionError("ollama")):
             self.assertEqual(listener.smoke_provider(), 2)
 
+    def test_smoke_claude_prints_sonnet_without_a_generation(self):
+        with patch.object(listener.pipeline, "provider_settings", return_value={"provider": "claude"}), \
+                patch.object(listener.telebot, "TeleBot", side_effect=AssertionError("telegram")), \
+                patch.object(listener.subprocess, "run", side_effect=AssertionError("claude")), \
+                patch.object(listener.pipeline.urllib.request, "urlopen", side_effect=AssertionError("ollama")):
+            self.assertEqual(listener.smoke_claude(), 0)
+
+    def test_smoke_claude_does_not_run_while_provider_is_ollama(self):
+        with patch.object(listener.pipeline, "provider_settings", return_value={"provider": "ollama", "model": "gemma4:12b-it-q4_K_M"}), \
+                patch.object(listener.telebot, "TeleBot", side_effect=AssertionError("telegram")), \
+                patch.object(listener.subprocess, "run", side_effect=AssertionError("claude")), \
+                patch.object(listener.pipeline.urllib.request, "urlopen", side_effect=AssertionError("ollama")):
+            self.assertEqual(listener.smoke_claude(), 2)
+
     def test_smoke_ollama_does_not_construct_telegram(self):
         settings = {"provider": "ollama", "model": "gemma4:12b-it-q4_K_M", "num_ctx": 4096, "think": False}
         extraction = {"topic": "Nota", "prompts": [{"title_en": "t"}]}

@@ -19,6 +19,9 @@ Manual run (same pipeline, no Telegram):
 Local provider probe (no Telegram, no fetch, no output files):
   .venv/bin/python prompt-listener.py --smoke-provider
 
+Claude config probe (no generation, no Telegram, no fetch):
+  .venv/bin/python prompt-listener.py --smoke-claude
+
 Read-only counts for jobs archived in .cache/failed (no writes, no Telegram):
   .venv/bin/python prompt-listener.py --retry-failed
 
@@ -664,6 +667,28 @@ def smoke_provider() -> int:
     return 0
 
 
+def smoke_claude() -> int:
+    """Print the resolved Claude id and effort. Does not run a generation."""
+    try:
+        settings = pipeline.provider_settings()
+    except pipeline.PipelineError as exc:
+        print(f"Errore: {exc}", file=sys.stderr)
+        return 1
+    if settings["provider"] != "claude":
+        print(
+            "Provider ollama: smoke Claude non eseguito. Nessuna chiamata a Ollama o Claude.",
+            file=sys.stderr,
+        )
+        return 2
+    chosen = pipeline.claude_choice(settings)
+    print(
+        f"Smoke Claude configurato: model={chosen['model']} effort={chosen['effort']} "
+        "tools=off. Nessuna generazione. CLAUDE_CODE_EFFORT_LEVEL è impostato solo sul processo figlio.",
+        flush=True,
+    )
+    return 0
+
+
 def process_once(url: str) -> int:
     try:
         print(pipeline.process({"url": url}))
@@ -747,6 +772,11 @@ def main():
         help="Prova il provider locale senza Telegram, senza fetch e senza scrivere file",
     )
     parser.add_argument(
+        "--smoke-claude",
+        action="store_true",
+        help="Mostra modello ed effort Claude senza generare e senza Telegram",
+    )
+    parser.add_argument(
         "--retry-failed",
         action="store_true",
         help="Conta i job in .cache/failed. Senza --execute non scrive nulla",
@@ -762,9 +792,9 @@ def main():
         help="Con --retry-failed, accetta i job originali in coda",
     )
     args = parser.parse_args()
-    selected = [args.check, bool(args.process), args.smoke_provider, args.retry_failed]
+    selected = [args.check, bool(args.process), args.smoke_provider, args.smoke_claude, args.retry_failed]
     if sum(selected) > 1:
-        parser.error("Scegli un solo comando tra --check, --process, --smoke-provider e --retry-failed")
+        parser.error("Scegli un solo comando tra --check, --process, --smoke-provider, --smoke-claude e --retry-failed")
     if args.dry_run and not args.retry_failed:
         parser.error("--dry-run richiede --retry-failed")
     if args.execute and not args.retry_failed:
@@ -776,6 +806,8 @@ def main():
         sys.exit(0 if check_setup() else 1)
     if args.smoke_provider:
         sys.exit(smoke_provider())
+    if args.smoke_claude:
+        sys.exit(smoke_claude())
     if args.retry_failed:
         sys.exit(retry_failed_cli(execute=args.execute))
     if args.process:
