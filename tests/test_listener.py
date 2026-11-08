@@ -2,6 +2,7 @@ import contextlib
 import importlib.util
 import json
 import logging
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -12,6 +13,7 @@ from unittest.mock import Mock, patch
 
 PROJECT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT))
+os.environ["PROMPTX_SKIP_DOTENV"] = "1"
 spec = importlib.util.spec_from_file_location("listener", PROJECT / "prompt-listener.py")
 listener = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(listener)
@@ -127,9 +129,13 @@ class QueueTests(unittest.TestCase):
 
     def test_setup_check_reports_logged_out_claude(self):
         result = subprocess.CompletedProcess([], 1, '{"loggedIn":false}', "")
-        with patch.object(listener, "BOT_TOKEN", "test"), patch.object(listener.subprocess, "run", return_value=result), \
+        with patch.object(listener, "BOT_TOKEN", "test"), \
+                patch.object(listener.pipeline, "provider_settings", return_value={"provider": "claude"}), \
+                patch.object(listener.pipeline.urllib.request, "urlopen", side_effect=AssertionError("ollama")), \
+                patch.object(listener.subprocess, "run", return_value=result) as run, \
                 patch.object(listener, "check_output", return_value="ok"):
             self.assertFalse(listener.check_setup())
+        run.assert_called()
 
     def test_setup_check_ollama_does_not_call_claude_or_telegram(self):
         settings = {
