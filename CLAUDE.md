@@ -71,7 +71,8 @@ Le istruzioni di estrazione per Claude sono `SYSTEM_PROMPT` in `pipeline.py`.
 - Ambiente Python: `.venv`
 - Servizio macOS: `com.promptx.listener` (LaunchAgent, `KeepAlive`)
 - Log permanente: `logs/listener.log` (stdout anche in `/tmp/promptx-listener.log`)
-- Coda: `.cache/queue/`; lavori falliti definitivamente: `.cache/failed/`
+- Coda: `.cache/queue/`; lavori falliti definitivamente: `.cache/failed/`;
+  copia originale dopo un retry accettato: `.cache/failed-audit/`
 - Stato e ultimo esito: `.cache/state.json`
 
 Errori temporanei (rete, sovraccarico, limiti d'uso, Mac in stop): 3 tentativi
@@ -100,6 +101,19 @@ Smoke del provider locale, senza Telegram, senza fetch e senza scrivere file
 ```bash
 .venv/bin/python prompt-listener.py --smoke-provider
 ```
+
+Retry dei job in `.cache/failed`, dal clone di servizio. Non sposta i file a
+mano. Il primo comando è sola lettura (conteggi, nessuna scrittura e nessun
+invio). Il secondo accetta i job originali in coda: il servizio già avviato li
+elabora sullo stesso `chat_id` e `message_id`. Non crea chat nuove.
+
+```bash
+.venv/bin/python prompt-listener.py --retry-failed
+.venv/bin/python prompt-listener.py --retry-failed --execute
+```
+
+`--retry-failed --dry-run` è identico al primo. Un secondo `--execute` non
+duplica la coda e non riscrive l'audit. `output_dir` non cambia.
 
 Test, dalla cartella sorgente (usano l'ambiente Python del servizio):
 

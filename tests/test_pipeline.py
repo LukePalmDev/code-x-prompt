@@ -42,10 +42,15 @@ class PipelineTests(unittest.TestCase):
             ("CLAUDE_WORKDIR", Path(self.temp.name) / "work"),
             ("configured_model", lambda: "claude-haiku-test"),
             ("fetch_thread", lambda url: {"author": "some_author", "tweet_text": "Thread intro", "thread": []}),
+            # Injected provider: a service config.yaml that selects Ollama must not leak in.
+            ("provider_settings", lambda: {"provider": "claude"}),
         ):
             patcher = patch.object(pipeline, target, value)
             patcher.start()
             self.addCleanup(patcher.stop)
+        live = patch.object(pipeline.urllib.request, "urlopen", side_effect=AssertionError("live Ollama"))
+        live.start()
+        self.addCleanup(live.stop)
         sleep = patch.object(pipeline.time, "sleep")
         sleep.start()
         self.addCleanup(sleep.stop)
@@ -54,6 +59,15 @@ class PipelineTests(unittest.TestCase):
         with patch.object(pipeline.subprocess, "run", side_effect=results) as run:
             output = pipeline.process(job if job is not None else {"url": URL})
         return output, run
+
+    def test_injected_provider_ignores_an_ollama_config_file(self):
+        config_dir = Path(self.temp.name) / "project"
+        config_dir.mkdir()
+        (config_dir / "config.yaml").write_text(
+            "output_dir: /tmp/out\nprovider: ollama\nollama:\n  model: gemma4:12b-it-q4_K_M\n"
+        )
+        with patch.object(pipeline, "PROJECT_DIR", config_dir):
+            self.assertEqual(pipeline.provider_settings(), {"provider": "claude"})
 
     def test_process_writes_bilingual_files(self):
         output, run = self.run_process(claude_result(extraction()))

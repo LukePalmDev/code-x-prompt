@@ -18,6 +18,12 @@ Manual run (same pipeline, no Telegram):
 
 Local provider probe (no Telegram, no fetch, no output files):
   .venv/bin/python prompt-listener.py --smoke-provider
+
+Read-only counts for jobs archived in .cache/failed (no writes, no Telegram):
+  .venv/bin/python prompt-listener.py --retry-failed
+
+Requeue those jobs for the running service, preserving chat and message ids:
+  .venv/bin/python prompt-listener.py --retry-failed --execute
 """
 
 import argparse
@@ -38,9 +44,12 @@ from pathlib import Path
 
 try:
     from dotenv import load_dotenv
-    load_dotenv(Path(__file__).parent / ".env")
 except ImportError:
-    pass
+    load_dotenv = None
+# Tests set PROMPTX_SKIP_DOTENV=1 so a checkout that contains the service .env
+# is not read. The LaunchAgent does not set this variable.
+if load_dotenv is not None and os.environ.get("PROMPTX_SKIP_DOTENV") != "1":
+    load_dotenv(Path(__file__).parent / ".env")
 
 import telebot
 
@@ -52,6 +61,8 @@ BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 PROJECT_DIR = pipeline.PROJECT_DIR
 QUEUE_DIR = pipeline.CACHE_DIR / "queue"
 FAILED_DIR = pipeline.CACHE_DIR / "failed"
+# Original failed records moved here only after the queue copy has been verified.
+AUDIT_DIR = pipeline.CACHE_DIR / "failed-audit"
 STATE_FILE = pipeline.CACHE_DIR / "state.json"
 LOG_FILE = PROJECT_DIR / "logs" / "listener.log"
 
@@ -156,6 +167,224 @@ def next_job():
 def archive_failed(path: Path) -> None:
     FAILED_DIR.mkdir(parents=True, exist_ok=True)
     os.replace(path, FAILED_DIR / path.name)
+
+
+def _telegram_int(value, allow_negative: bool) -> bool:
+    if isinstance(value, bool) or not isinstance(value, int):
+        return False
+    if value == 0 or (value < 0 and not allow_negative):
+        return False
+    return True
+
+
+def failed_identity(path: Path, job):
+    """Return the tweet id when the archived job can be retried on its original route.
+
+    chat_id and message_id must already be in the file. Nothing here invents a chat.
+    """
+    if path.is_symlink() or not path.is_file() or not isinstance(job, dict):
+        return None
+    url = job.get("url")
+    if not isinstance(url, str) or X_URL_RE.search(url) is None:
+        return None
+    try:
+        tweet = pipeline.tweet_id(url)
+    except pipeline.PipelineError:
+        return None
+    if path.name != f"{tweet}.json":
+        return None
+    if not _telegram_int(job.get("chat_id"), allow_negative=True):
+        return None
+    if not _telegram_int(job.get("message_id"), allow_negative=False):
+        return None
+    received = job.get("received")
+    if isinstance(received, bool) or not isinstance(received, (int, float)):
+        return None
+    return tweet
+
+
+def queue_matches(path: Path, payload: dict) -> bool:
+    loaded = read_json(path, None)
+    if not isinstance(loaded, dict):
+        return False
+    return (
+        loaded.get("url") == payload["url"]
+        and loaded.get("chat_id") == payload["chat_id"]
+        and loaded.get("message_id") == payload["message_id"]
+        and loaded.get("rounds") == 0
+        and loaded.get("retry_at") == 0
+    )
+
+
+def same_route(existing: dict, job: dict) -> bool:
+    return (
+        existing.get("url") == job.get("url")
+        and existing.get("chat_id") == job.get("chat_id")
+        and existing.get("message_id") == job.get("message_id")
+    )
+
+
+def _json_files(directory: Path) -> list:
+    if not directory.is_dir():
+        return []
+    files = [path for path in directory.glob("*.json") if path.is_symlink() or path.is_file()]
+    return sorted(files, key=lambda path: path.name)
+
+
+def _audit_destination(failed_path: Path) -> Path:
+    """A new path. Existing audit files are never replaced."""
+    AUDIT_DIR.mkdir(parents=True, exist_ok=True)
+    primary = AUDIT_DIR / failed_path.name
+    if not primary.exists():
+        return primary
+    stamp = time.strftime("%Y%m%d%H%M%S", time.gmtime())
+    candidate = AUDIT_DIR / f"{failed_path.stem}.{stamp}.json"
+    number = 2
+    while candidate.exists():
+        candidate = AUDIT_DIR / f"{failed_path.stem}.{stamp}.{number}.json"
+        number += 1
+    return candidate
+
+
+def _park_original(failed_path: Path) -> None:
+    os.replace(failed_path, _audit_destination(failed_path))
+
+
+def _empty_retry_counts() -> dict:
+    return {key: 0 for key in (
+        "queue", "queue_ready", "queue_delayed", "failed", "audit",
+        "eligible", "accepted", "audit_completed",
+        "skipped_queued", "skipped_processed", "skipped_invalid", "skipped_conflict",
+        "rolled_back", "errors",
+    )}
+
+
+def _snapshot_counts(counts: dict) -> None:
+    now = time.time()
+    jobs = queued_jobs()
+    ready = sum(1 for job, _path in jobs if job.get("retry_at", 0) <= now)
+    counts["queue"] = len(jobs)
+    counts["queue_ready"] = ready
+    counts["queue_delayed"] = len(jobs) - ready
+    counts["failed"] = len(_json_files(FAILED_DIR))
+    counts["audit"] = len(_json_files(AUDIT_DIR))
+
+
+def _retry_record(path: Path, processed: dict, execute: bool, counts: dict, lines: list) -> None:
+    if path.is_symlink() or not path.is_file():
+        counts["skipped_invalid"] += 1
+        lines.append(f"skip-invalid {path.name}")
+        return
+    job = read_json(path, None)
+    tweet = failed_identity(path, job)
+    if tweet is None:
+        counts["skipped_invalid"] += 1
+        lines.append(f"skip-invalid {path.name}")
+        return
+    if tweet in processed:
+        counts["skipped_processed"] += 1
+        lines.append(f"skip-processed {tweet}")
+        return
+    queue_path = QUEUE_DIR / path.name
+    if queue_path.exists():
+        existing = read_json(queue_path, None)
+        if not (isinstance(existing, dict) and same_route(existing, job)):
+            counts["skipped_conflict"] += 1
+            lines.append(f"skip-conflict {tweet}")
+            return
+        if not execute:
+            counts["skipped_queued"] += 1
+            lines.append(f"skip-queued {tweet} chat={job['chat_id']} message={job['message_id']}")
+            return
+        try:
+            _park_original(path)
+        except OSError as exc:
+            counts["errors"] += 1
+            lines.append(f"error {tweet} {exc}")
+            return
+        counts["audit_completed"] += 1
+        lines.append(f"audit-completed {tweet} chat={job['chat_id']} message={job['message_id']}")
+        return
+    counts["eligible"] += 1
+    if not execute:
+        lines.append(f"eligible {tweet} chat={job['chat_id']} message={job['message_id']}")
+        return
+    payload = dict(job)
+    payload["rounds"] = 0
+    payload["retry_at"] = 0
+    try:
+        QUEUE_DIR.mkdir(parents=True, exist_ok=True)
+        pipeline.write_json(queue_path, payload)
+    except OSError as exc:
+        counts["errors"] += 1
+        lines.append(f"error {tweet} {exc}")
+        return
+    if not queue_matches(queue_path, payload):
+        try:
+            queue_path.unlink()
+        except OSError as exc:
+            counts["errors"] += 1
+            lines.append(f"error {tweet} {exc}")
+            return
+        counts["rolled_back"] += 1
+        lines.append(f"rollback {tweet}")
+        return
+    try:
+        _park_original(path)
+    except OSError as exc:
+        # The queue file is already valid. Leave the failed record for a later
+        # execute, which only parks it (audit_completed) and does not rewrite the queue.
+        counts["errors"] += 1
+        lines.append(f"error {tweet} {exc}")
+        return
+    counts["accepted"] += 1
+    lines.append(f"accepted {tweet} chat={job['chat_id']} message={job['message_id']}")
+
+
+def retry_failed(execute: bool = False) -> dict:
+    """Count or requeue `.cache/failed` jobs.
+
+    The default is read-only. `execute=True` copies a job into the queue and
+    only then moves the original file to `.cache/failed-audit`. The copy keeps
+    url, chat_id, message_id, received and any saved extraction. rounds and
+    retry_at restart at 0. Already queued, already processed, or invalid
+    records are not rewritten. This function does not send Telegram or call
+    the model; the running service delivers the original chat.
+    """
+    def run():
+        counts = _empty_retry_counts()
+        lines = []
+        processed = pipeline.load_processed()
+        for path in _json_files(FAILED_DIR):
+            _retry_record(path, processed, execute, counts, lines)
+        _snapshot_counts(counts)
+        return {"mode": "execute" if execute else "dry-run", "counts": counts, "lines": lines}
+
+    if not execute:
+        return run()
+    with pipeline.exclusive_lock():
+        return run()
+
+
+def format_retry_report(report: dict) -> str:
+    order = (
+        "queue", "queue_ready", "queue_delayed", "failed", "audit",
+        "eligible", "accepted", "audit_completed",
+        "skipped_queued", "skipped_processed", "skipped_invalid", "skipped_conflict",
+        "rolled_back", "errors",
+    )
+    lines = [f"mode={report['mode']}"]
+    lines.extend(f"{key}={report['counts'][key]}" for key in order)
+    lines.extend(report["lines"])
+    return "\n".join(lines)
+
+
+def retry_failed_cli(execute: bool) -> int:
+    report = retry_failed(execute=execute)
+    print(format_retry_report(report), flush=True)
+    if report["counts"]["errors"] or report["counts"]["rolled_back"]:
+        return 1
+    return 0
 
 
 # ─── Telegram ─────────────────────────────────────────────────────────────────
@@ -517,12 +746,38 @@ def main():
         action="store_true",
         help="Prova il provider locale senza Telegram, senza fetch e senza scrivere file",
     )
+    parser.add_argument(
+        "--retry-failed",
+        action="store_true",
+        help="Conta i job in .cache/failed. Senza --execute non scrive nulla",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Con --retry-failed, elenco e conteggi senza scrivere",
+    )
+    parser.add_argument(
+        "--execute",
+        action="store_true",
+        help="Con --retry-failed, accetta i job originali in coda",
+    )
     args = parser.parse_args()
+    selected = [args.check, bool(args.process), args.smoke_provider, args.retry_failed]
+    if sum(selected) > 1:
+        parser.error("Scegli un solo comando tra --check, --process, --smoke-provider e --retry-failed")
+    if args.dry_run and not args.retry_failed:
+        parser.error("--dry-run richiede --retry-failed")
+    if args.execute and not args.retry_failed:
+        parser.error("--execute richiede --retry-failed")
+    if args.dry_run and args.execute:
+        parser.error("Scegli --dry-run oppure --execute")
     setup_logging()
     if args.check:
         sys.exit(0 if check_setup() else 1)
     if args.smoke_provider:
         sys.exit(smoke_provider())
+    if args.retry_failed:
+        sys.exit(retry_failed_cli(execute=args.execute))
     if args.process:
         sys.exit(process_once(args.process))
     if not BOT_TOKEN:

@@ -152,6 +152,9 @@ Reliability:
 - Transient failures (network, overload, usage limits) are retried three times
   immediately, then after 15 minutes, 1 hour and 3 hours. Permanent failures
   are moved to `.cache/failed/`. Every outcome is reported on Telegram.
+- Archived failures are not retried by themselves. `--retry-failed` is the
+  supported way to put them back on the original Telegram chat. Do not move
+  those JSON files by hand.
 - An unexpected restart is reported to the chat that first used the bot.
 - A post already processed (`.cache/processed.json`) is answered without
   calling Claude; existing folders are never reused for a different post.
@@ -290,6 +293,34 @@ Model smoke, only after the service config sets `provider: ollama` and the verif
 ```
 
 Leave the LaunchAgent on Claude until that command has been run on the mini and the result is accepted. Deploy of this code with the existing `config.yaml` does not change the provider.
+
+## Retry archived jobs
+
+A job that exhausted its retries stays in `.cache/failed/{tweet_id}.json` with the original `url`, `chat_id`, `message_id` and `received`. The running service does not pick it up again until this command accepts it. Nothing in the command sends Telegram, fetches X, or calls the model. After a successful accept, the service already running delivers the result to that same chat and reply message.
+
+From the service clone, read-only counts and the per-job decision:
+
+```bash
+.venv/bin/python prompt-listener.py --retry-failed
+```
+
+`--retry-failed --dry-run` is the same read-only command. It does not create or rewrite `.cache/queue`, `.cache/failed`, or `.cache/failed-audit`.
+
+Accept the eligible records into the queue:
+
+```bash
+.venv/bin/python prompt-listener.py --retry-failed --execute
+```
+
+`--execute` writes a queue copy, checks that `url`, `chat_id`, `message_id`, `rounds=0` and `retry_at=0` read back, and only then moves the original file to `.cache/failed-audit/`. The audit file is the original bytes. A second execute does not create another queue file and does not replace an audit file. Records already listed in `.cache/processed.json`, already queued for the same chat, missing a real `chat_id` or `message_id`, or stored under the wrong file name are left where they are. `output_dir` is not changed.
+
+The lines `eligible` and `accepted` include `chat=` and `message=` from the archived job. Those are the only route used. The bot token is not printed.
+
+Regression tests do not read `.env` or the service `config.yaml`. They inject the provider. Run them once on a checkout with no `config.yaml`, and they also pass when that file selects Ollama:
+
+```bash
+.venv/bin/python -m unittest discover -s tests -v
+```
 
 ## Notes
 
