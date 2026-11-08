@@ -28,6 +28,19 @@ output_dir: "~/Documents/prompt-x-output"
 # POST /api/chat `think` boolean. keep_alive must not be 0: that would unload
 # the model shared with Trader. This file does not change the Ollama service.
 #
+# Claude is the pipeline default. The full id is Sonnet 5.5, which the
+# `sonnet` alias selects on the Anthropic API. Claude Code 2.1.317 accepts
+# --effort medium. CLAUDE_CODE_EFFORT_LEVEL overrides that flag, so the
+# pipeline sets it on the Claude child process only. Thinking on Sonnet 5.5
+# cannot be turned off. There is no Haiku default and no fallback model.
+# A weekly quota stop is not retried; the reported reset is 06:00 Europe/Rome.
+# The 5-hour percent is shown only when the CLI JSON includes it.
+#
+# provider: claude
+# claude:
+#   model: "claude-sonnet-5-5"
+#   effort: medium
+#
 # provider: ollama
 # ollama:
 #   base_url: "http://127.0.0.1:11434"

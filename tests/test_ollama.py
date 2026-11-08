@@ -307,15 +307,21 @@ class ProviderConfigTests(unittest.TestCase):
     def test_absent_config_stays_on_claude(self):
         with tempfile.TemporaryDirectory() as directory:
             with patch.object(pipeline, "PROJECT_DIR", Path(directory)):
-                self.assertEqual(pipeline.provider_settings(), {"provider": "claude"})
+                self.assertEqual(pipeline.provider_settings(), {
+                    "provider": "claude", "model": "claude-sonnet-5-5", "effort": "medium",
+                })
 
     def test_blank_provider_stays_on_claude(self):
         self.write_config("output_dir: out\nprovider: ''\n")
-        self.assertEqual(pipeline.provider_settings(), {"provider": "claude"})
+        self.assertEqual(pipeline.provider_settings(), {
+            "provider": "claude", "model": "claude-sonnet-5-5", "effort": "medium",
+        })
 
     def test_explicit_claude_ignores_a_broken_ollama_block(self):
         self.write_config("output_dir: out\nprovider: claude\nollama:\n  model: 'not a tag'\n")
-        self.assertEqual(pipeline.provider_settings(), {"provider": "claude"})
+        self.assertEqual(pipeline.provider_settings(), {
+            "provider": "claude", "model": "claude-sonnet-5-5", "effort": "medium",
+        })
 
     def test_verified_tag_and_defaults_are_explicit(self):
         self.write_config(f"output_dir: out\nprovider: ollama\nollama:\n  model: {TAG}\n")

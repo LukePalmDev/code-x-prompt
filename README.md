@@ -247,6 +247,29 @@ Inside a Claude Code session, pasting an X link makes Claude run this command
 | `ollama.keep_alive` | Per-request keep-alive. `0` is rejected so this client does not unload a shared model. | `5m` |
 | `ollama.temperature` | Sampling temperature. | `0` |
 
+## Claude provider
+
+The pipeline calls Claude Code with tools disabled. The model id is `claude-sonnet-5-5` (Sonnet 5.5, the model the `sonnet` alias selects on the Anthropic API; it needs Claude Code 2.1.284 or newer, and 2.1.317 provides `--effort medium`). Effort is `medium`. `CLAUDE_CODE_EFFORT_LEVEL` overrides the flag, so that variable is set on the Claude child process and not in the service environment. Thinking on Sonnet 5.5 cannot be disabled. The command does not pass `--fallback-model` and does not read a Haiku id from `.claude/settings.json`.
+
+```yaml
+provider: claude
+claude:
+  model: "claude-sonnet-5-5"
+  effort: medium
+```
+
+While the service `config.yaml` still says `provider: ollama`, this code keeps using Ollama. Switching is that edit in the service clone. It is not in git. A plan-limit error is archived once and is not retried at 15 minutes, 1 hour, and 3 hours. The weekly reset reported for this account is 06:00 Europe/Rome. That is not a 5-hour window.
+
+`claude -p --output-format json` can include `usage` token counts and `total_cost_usd`. Those numbers are copied onto the existing success line when they are present. They are not converted into a quota percent. `/usage` is interactive and is not run. If the JSON has no `rate_limits.five_hour.used_percentage`, the line says `quota_5h non disponibile`.
+
+Check the resolved id without a generation, without Telegram, and without fetching X:
+
+```bash
+.venv/bin/python prompt-listener.py --smoke-claude
+```
+
+Exit 2 means the service config is still Ollama, and neither Claude nor Ollama was called.
+
 ## Optional local Ollama
 
 The running service stays on Claude until `config.yaml` in the service clone sets `provider: ollama`. Copying `config.yaml.example` does not switch provider: the Ollama block is commented. Do not change the Ollama service, its environment, or the models it has loaded. Trader (gaming-classifier) already uses the same server and the same tag.

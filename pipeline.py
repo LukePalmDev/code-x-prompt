@@ -55,7 +55,17 @@ ENV["PATH"] = os.pathsep.join([
 ])
 CLAUDE_CMD = shutil.which("claude", path=ENV["PATH"]) or "claude"
 
-FALLBACK_MODEL = "sonnet"
+# Anthropic API alias `sonnet` resolves to Sonnet 5.5. The full id is pinned so a
+# provider that maps the alias to an older Sonnet cannot be selected by accident.
+# Sonnet 5.5 needs Claude Code >= 2.1.284. CLI 2.1.317 accepts --effort
+# low|medium|high|xhigh|max. CLAUDE_CODE_EFFORT_LEVEL overrides that flag, so it
+# is set on the child process only. Thinking on Sonnet 5.5 cannot be disabled.
+# https://code.claude.com/docs/en/model-config
+# https://code.claude.com/docs/en/cli-reference
+CLAUDE_SONNET_MODEL = "claude-sonnet-5-5"
+CLAUDE_EFFORT = "medium"
+CLAUDE_EFFORTS = ("low", "medium", "high", "xhigh", "max")
+_CLAUDE_MODEL_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 MAX_EXTRACTION_ATTEMPTS = 3
 RETRY_DELAYS = (5, 15)
 CLAUDE_TIMEOUT = 600
@@ -98,9 +108,6 @@ TRANSIENT_ERROR_MARKERS = (
     "connection error",
     "connection lost",
     "connection reset",
-    "hit your limit",
-    # A retired pinned model is recovered by the Sonnet fallback.
-    "issue with the selected model",
     "network error",
     "overloaded",
     "rate limit",
@@ -113,7 +120,15 @@ TRANSIENT_ERROR_MARKERS = (
     "status code 503",
     "status code 529",
     "token has expired",
+)
+# Plan limits are not retried. The operator-reported weekly reset is 06:00
+# Europe/Rome. That clock is not a 5-hour window and is not a computed percent.
+QUOTA_ERROR_MARKERS = (
+    "5-hour limit",
+    "hit your limit",
+    "out of extra usage",
     "usage limit",
+    "weekly limit",
 )
 # Smallest plausible complete prompt file when iCloud hides its content.
 MIN_CLOUD_FILE_BYTES = 64
@@ -170,7 +185,14 @@ class PipelineError(Exception):
         self.transient = transient
 
 
+def is_quota_error(message: str) -> bool:
+    normalized = message.lower()
+    return any(marker in normalized for marker in QUOTA_ERROR_MARKERS)
+
+
 def is_transient_error(message: str) -> bool:
+    if is_quota_error(message):
+        return False
     normalized = message.lower()
     return any(marker in normalized for marker in TRANSIENT_ERROR_MARKERS)
 
@@ -326,6 +348,40 @@ def _ollama_block(block) -> dict:
     }
 
 
+def _claude_block(block) -> dict:
+    """Explicit Sonnet id and effort. Haiku and a fallback model are not filled in."""
+    if block is None:
+        block = {}
+    if not isinstance(block, dict):
+        raise PipelineError("claude in config.yaml deve essere un mapping.", transient=False)
+    model = block.get("model", CLAUDE_SONNET_MODEL)
+    if model is None or (isinstance(model, str) and not model.strip()):
+        model = CLAUDE_SONNET_MODEL
+    if not isinstance(model, str) or not _CLAUDE_MODEL_ID.fullmatch(model.strip()):
+        raise PipelineError("claude.model non è un id valido.", transient=False)
+    model = model.strip()
+    lowered = model.lower()
+    if lowered == "haiku" or lowered.startswith("claude-haiku"):
+        raise PipelineError(
+            "claude.model non può essere Haiku. L'id esplicito è claude-sonnet-5-5.",
+            transient=False,
+        )
+    effort = block.get("effort", CLAUDE_EFFORT)
+    if not isinstance(effort, str) or effort.strip().lower() not in CLAUDE_EFFORTS:
+        raise PipelineError(
+            "claude.effort deve essere low, medium, high, xhigh o max.",
+            transient=False,
+        )
+    return {"provider": "claude", "model": model, "effort": effort.strip().lower()}
+
+
+def claude_choice(settings: dict) -> dict:
+    """Fill model and effort when a caller only injected provider=claude."""
+    if settings.get("provider") not in (None, "claude"):
+        raise PipelineError("provider non è claude.", transient=False)
+    return _claude_block({"model": settings.get("model", CLAUDE_SONNET_MODEL), "effort": settings.get("effort", CLAUDE_EFFORT)})
+
+
 def provider_settings() -> dict:
     """Claude unless config.yaml sets provider to ollama. Extra keys are ignored."""
     config = read_config_file() or {}
@@ -336,7 +392,7 @@ def provider_settings() -> dict:
         raise PipelineError("provider in config.yaml deve essere una stringa.", transient=False)
     provider = raw.strip().lower()
     if provider == "claude":
-        return {"provider": "claude"}
+        return _claude_block(config.get("claude"))
     if provider == "ollama":
         return _ollama_block(config.get("ollama"))
     raise PipelineError(
@@ -347,11 +403,8 @@ def provider_settings() -> dict:
 
 
 def configured_model() -> str:
-    try:
-        settings = json.loads((PROJECT_DIR / ".claude" / "settings.json").read_text())
-    except (OSError, ValueError):
-        return "haiku"
-    return settings.get("model") or "haiku"
+    """The pipeline model comes from config.yaml, not from .claude/settings.json."""
+    return claude_choice(provider_settings())["model"]
 
 
 def tweet_id(url: str) -> str:
@@ -684,26 +737,114 @@ def smoke_local_extraction() -> dict:
     return extraction
 
 
-def run_claude(source: str, existing: list, model: str) -> dict:
-    """One extraction call; raises PipelineError on any failure."""
+def _whole_number(value):
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value
+
+
+def _real_number(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return value
+
+
+def collect_claude_stats(response: dict) -> dict:
+    """Copy token, cost, and latency fields the CLI JSON actually contains.
+
+    A 5-hour quota percent is recorded only when `rate_limits.five_hour.used_percentage`
+    is present. Tokens and `total_cost_usd` are not turned into a percent.
+    `/usage` is interactive and is not called.
+    """
+    if not isinstance(response, dict):
+        return {}
+    stats = {}
+    usage = response.get("usage")
+    if isinstance(usage, dict):
+        for key in ("input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"):
+            number = _whole_number(usage.get(key))
+            if number is not None:
+                stats[key] = number
+    model_usage = response.get("modelUsage")
+    if not isinstance(model_usage, dict):
+        model_usage = response.get("model_usage")
+    if isinstance(model_usage, dict) and len(model_usage) == 1:
+        name, entry = next(iter(model_usage.items()))
+        if isinstance(name, str) and name.strip():
+            stats["effective_model"] = name.strip()
+        if isinstance(entry, dict) and "input_tokens" not in stats:
+            for source, dest in (
+                ("inputTokens", "input_tokens"),
+                ("outputTokens", "output_tokens"),
+                ("cacheReadInputTokens", "cache_read_input_tokens"),
+                ("cacheCreationInputTokens", "cache_creation_input_tokens"),
+            ):
+                number = _whole_number(entry.get(source))
+                if number is not None:
+                    stats[dest] = number
+    cost = _real_number(response.get("total_cost_usd"))
+    if cost is not None:
+        stats["total_cost_usd"] = cost
+    for key in ("duration_ms", "duration_api_ms"):
+        number = _whole_number(response.get(key))
+        if number is not None:
+            stats[key] = number
+    rate_limits = response.get("rate_limits")
+    window = rate_limits.get("five_hour") if isinstance(rate_limits, dict) else None
+    if isinstance(window, dict):
+        percent = _real_number(window.get("used_percentage"))
+        if percent is not None:
+            stats["quota_5h_percent"] = percent
+    return stats
+
+
+def format_claude_stats(stats: dict, model: str, effort: str) -> str:
+    measured = [key for key in (
+        "input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens",
+        "total_cost_usd", "duration_ms", "duration_api_ms", "quota_5h_percent",
+    ) if key in stats]
+    if not measured:
+        return ""
+    parts = [f"modello {stats.get('effective_model') or model}", f"effort {effort}"]
+    labels = (
+        ("input_tokens", "in"),
+        ("output_tokens", "out"),
+        ("cache_read_input_tokens", "cache_read"),
+        ("cache_creation_input_tokens", "cache_create"),
+        ("total_cost_usd", "cost_usd"),
+        ("duration_ms", "latency_ms"),
+        ("duration_api_ms", "latency_api_ms"),
+    )
+    for key, label in labels:
+        if key in stats:
+            parts.append(f"{label} {stats[key]}")
+    if "quota_5h_percent" in stats:
+        parts.append(f"quota_5h {stats['quota_5h_percent']}%")
+    else:
+        parts.append("quota_5h non disponibile")
+    return " ".join(parts)
+
+
+def run_claude(source: str, existing: list, model: str, effort: str) -> dict:
+    """One tool-less extraction. Effort is set on this child only."""
     request = extraction_request(source, existing)
     command = [
         CLAUDE_CMD, "-p", request,
         "--model", model,
+        "--effort", effort,
         "--tools", "",
         "--no-session-persistence",
         "--system-prompt", SYSTEM_PROMPT,
         "--output-format", "json",
         "--json-schema", json.dumps(EXTRACTION_SCHEMA),
     ]
-    if model != FALLBACK_MODEL:
-        # The CLI rejects a fallback equal to the main model.
-        command += ["--fallback-model", FALLBACK_MODEL]
+    child_env = dict(ENV)
+    child_env["CLAUDE_CODE_EFFORT_LEVEL"] = effort
     CLAUDE_WORKDIR.mkdir(exist_ok=True)
     try:
         result = subprocess.run(
             command, cwd=CLAUDE_WORKDIR, capture_output=True, text=True,
-            timeout=CLAUDE_TIMEOUT, env=ENV,
+            timeout=CLAUDE_TIMEOUT, env=child_env,
         )
     except subprocess.TimeoutExpired:
         raise PipelineError(f"Claude ha superato {CLAUDE_TIMEOUT // 60} minuti.", transient=True)
@@ -719,26 +860,42 @@ def run_claude(source: str, existing: list, model: str) -> dict:
         message = "\n".join(filter(None, [
             str(response.get("result") or ""), result.stderr.strip(),
         ])) or "Errore sconosciuto di Claude."
+        if is_quota_error(message):
+            raise PipelineError(
+                f"{message} Quota esaurita: nessun retry automatico. "
+                "Reset settimanale segnalato: 06:00 Europe/Rome. "
+                "La percentuale della finestra 5h non è disponibile in questa risposta.",
+                transient=False,
+            )
         raise PipelineError(message, transient=is_transient_error(message))
     try:
-        return validate_extraction(response.get("structured_output"))
+        extraction = validate_extraction(response.get("structured_output"))
     except ValueError as exc:
-        # The model answered badly; a retry (with Sonnet) usually fixes it.
         raise PipelineError(f"Risposta di Claude non valida: {exc}", transient=True)
+    stats = format_claude_stats(collect_claude_stats(response), model, effort)
+    if stats:
+        extraction["_claude_stats"] = stats
+    return extraction
 
 
 def extract_with_claude(source: str, existing: list) -> dict:
-    models = [configured_model()] + [FALLBACK_MODEL] * (MAX_EXTRACTION_ATTEMPTS - 1)
-    for attempt, model in enumerate(models, 1):
+    chosen = claude_choice(provider_settings())
+    model, effort = chosen["model"], chosen["effort"]
+    for attempt in range(1, MAX_EXTRACTION_ATTEMPTS + 1):
         try:
-            extraction = run_claude(source, existing, model)
+            extraction = run_claude(source, existing, model, effort)
         except PipelineError as exc:
-            log.warning("Extraction attempt %d/%d (%s) failed: %s", attempt, len(models), model, exc)
-            if not exc.transient or attempt == len(models):
+            log.warning(
+                "Extraction attempt %d/%d (%s, effort %s) failed: %s",
+                attempt, MAX_EXTRACTION_ATTEMPTS, model, effort, exc,
+            )
+            if not exc.transient or attempt == MAX_EXTRACTION_ATTEMPTS:
+                if exc.transient and attempt == MAX_EXTRACTION_ATTEMPTS and "non valida" in str(exc):
+                    raise PipelineError(str(exc), transient=False) from exc
                 raise
             time.sleep(RETRY_DELAYS[attempt - 1])
         else:
-            log.info("Extracted %d prompts with %s", len(extraction["prompts"]), model)
+            log.info("Extracted %d prompts with %s effort %s", len(extraction["prompts"]), model, effort)
             return extraction
 
 
@@ -846,8 +1003,11 @@ def process(job: dict, save=lambda job: None) -> str:
             if not source:
                 raise PipelineError("Il post non contiene testo.")
             extraction = extract_prompts(source, existing)
+            stats_line = extraction.pop("_claude_stats", None)
             report_non_verbatim(source, extraction["prompts"])
             job.update(author=data.get("author") or "", extraction=extraction)
+            if stats_line:
+                job["_claude_stats"] = stats_line
             save(job)
 
         prompts = job["extraction"]["prompts"]
@@ -865,6 +1025,9 @@ def process(job: dict, save=lambda job: None) -> str:
             raise PipelineError(f"Scrittura dei file non riuscita: {exc}", transient=True)
         except ValueError as exc:
             raise PipelineError(f"Verifica dei file non riuscita: {exc}")
+        stats_line = job.get("_claude_stats")
+        if isinstance(stats_line, str) and stats_line:
+            verified = verified + "\n" + stats_line
         remember_processed(url, verified)
-        log.info("Completed %s: %s", post_id, verified)
+        log.info("Completed %s: %s", post_id, verified.split("\n", 1)[0])
         return verified

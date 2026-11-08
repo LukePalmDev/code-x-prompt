@@ -38,7 +38,9 @@ class IsolatedConfigTests(unittest.TestCase):
         self.write(None)
         with patch.object(pipeline.urllib.request, "urlopen", side_effect=AssertionError("ollama")), \
                 patch.object(pipeline.subprocess, "run", side_effect=AssertionError("claude")):
-            self.assertEqual(pipeline.provider_settings(), {"provider": "claude"})
+            self.assertEqual(pipeline.provider_settings(), {
+                "provider": "claude", "model": "claude-sonnet-5-5", "effort": "medium",
+            })
 
     def test_ollama_config_selects_the_tag_without_calling_it(self):
         self.write(f"output_dir: /tmp/prompts\nprovider: ollama\nollama:\n  model: {TAG}\n")
