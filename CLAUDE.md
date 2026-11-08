@@ -100,7 +100,15 @@ Smoke del provider locale, senza Telegram, senza fetch e senza scrivere file
 
 ```bash
 .venv/bin/python prompt-listener.py --smoke-provider
+.venv/bin/python prompt-listener.py --smoke-long
 ```
+
+`--smoke-long` usa un thread sintetico, senza Telegram e senza fetch. Va lanciato
+a coda ferma. Con `num_ctx` 8192 e `num_predict` 2048 ogni segmento porta circa
+1024 token di testo e le chiamate sono una alla volta: un post lungo richiede
+qualche minuto, non tre ripetizioni della stessa chiamata. Un output tagliato
+da `num_predict` spezza il segmento. Il tetto di una singola traduzione è 3584,
+mai 262144. Lo stesso meccanismo vale con 4096.
 
 Retry dei job in `.cache/failed`, dal clone di servizio. Non sposta i file a
 mano. Il primo comando è sola lettura (conteggi, nessuna scrittura e nessun
@@ -113,7 +121,9 @@ elabora sullo stesso `chat_id` e `message_id`. Non crea chat nuove.
 ```
 
 `--retry-failed --dry-run` è identico al primo. Un secondo `--execute` non
-duplica la coda e non riscrive l'audit. `output_dir` non cambia.
+duplica la coda e non riscrive l'audit. `output_dir` non cambia. Aspetta che
+`queue=0` prima di rilanciare i falliti: il job già riuscito sta in
+`processed.json` e non va rimandato. `skip-processed` non si esegue.
 
 Test, dalla cartella sorgente (usano l'ambiente Python del servizio):
 

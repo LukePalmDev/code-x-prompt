@@ -266,7 +266,9 @@ ollama:
   keep_alive: "5m"
 ```
 
-`gemma4:12b-it-q4_K_M` is about 8.0GB (Q4_K_M). On the Mac mini M4 with 16GB of memory, a local smoke at `num_ctx` 4096 left about 14% RAM free, took about 35 seconds including the cold load, and generated at about 23 tokens per second. That measurement is why 4096 is sent explicitly. A missing `num_ctx` would otherwise follow the model default, which previously truncated a classifier at 4K and whose card context is 262144, too large for this machine. Posts that do not fit the budget fail before the request. The reply is discarded when generation hits `num_predict`, when `prompt_eval_count` fills `num_ctx`, or when the JSON does not match the schema. Nothing is shortened and then saved.
+`gemma4:12b-it-q4_K_M` is about 8.0GB (Q4_K_M). On the Mac mini M4 with 16GB of memory, a local smoke at `num_ctx` 4096 left about 14% RAM free, took about 35 seconds including the cold load, and generated at about 23 tokens per second. A later run at `num_ctx` 8192 left about 17% free. Keep the service on 8192 for now. Do not raise it toward the model-card context 262144.
+
+Long threads are cut on tweet, paragraph, and line boundaries and sent one segment at a time. Joining the segments is the original text; nothing is dropped or shortened to fit. With `num_predict` 2048 each segment carries about 1024 tokens of source (about 3000 characters), so a thread of roughly 4500 tokens is about five sequential calls. At about 23 tokens per second that is a few minutes, not three repeats of the same call. A reply that hits `num_predict` splits that segment instead of sending it again. One prompt that still cannot fit may use a higher `num_predict`, never above 3584 and never above the room left in `num_ctx`. The same splitter works at 4096. Calls stay serial. Invalid JSON and network errors can still be retried; an output-length stop cannot.
 
 `think` is the [Ollama chat field](https://docs.ollama.com/api/chat): `true` requests a thinking trace, `false` requests none, and omitting it on the wire uses the model default. This model's default is thinking on, so every extraction sends `false` unless `ollama.think` is `true`. The schema goes in `format`. `tools` is not sent. Structured output uses the same system prompt and the same `topic` / `prompts` object as Claude.
 
@@ -290,6 +292,12 @@ Model smoke, only after the service config sets `provider: ollama` and the verif
 
 ```bash
 .venv/bin/python prompt-listener.py --smoke-provider
+```
+
+Semantic check for a long thread, after the queue is idle. It uses the synthetic text in the program, not a real post. It does not send Telegram, fetch X, or write prompt files. Expect several sequential calls and a few minutes:
+
+```bash
+.venv/bin/python prompt-listener.py --smoke-long
 ```
 
 Leave the LaunchAgent on Claude until that command has been run on the mini and the result is accepted. Deploy of this code with the existing `config.yaml` does not change the provider.

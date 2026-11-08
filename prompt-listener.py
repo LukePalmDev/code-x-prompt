@@ -19,6 +19,9 @@ Manual run (same pipeline, no Telegram):
 Local provider probe (no Telegram, no fetch, no output files):
   .venv/bin/python prompt-listener.py --smoke-provider
 
+Long synthetic thread, still no Telegram and no fetch (several local calls, one at a time):
+  .venv/bin/python prompt-listener.py --smoke-long
+
 Read-only counts for jobs archived in .cache/failed (no writes, no Telegram):
   .venv/bin/python prompt-listener.py --retry-failed
 
@@ -664,6 +667,33 @@ def smoke_provider() -> int:
     return 0
 
 
+def smoke_long() -> int:
+    """Segmented smoke. Never constructs the Telegram bot or fetches a post."""
+    try:
+        settings = pipeline.provider_settings()
+    except pipeline.PipelineError as exc:
+        print(f"Errore: {exc}", file=sys.stderr)
+        return 1
+    if settings["provider"] != "ollama":
+        print(
+            "Provider claude: smoke lungo non eseguito. Nessuna chiamata a Claude o Telegram.",
+            file=sys.stderr,
+        )
+        return 2
+    try:
+        result = pipeline.smoke_long_extraction()
+    except pipeline.PipelineError as exc:
+        print(f"Errore: {exc}", file=sys.stderr)
+        return 1
+    print(
+        f"Smoke lungo ok: segmenti {result['segments']}, prompt {result['prompts']}, "
+        f"topic {result['topic']!r}, modello {result['model']}, "
+        f"num_ctx {result['num_ctx']}, num_predict {result['num_predict']}.",
+        flush=True,
+    )
+    return 0
+
+
 def process_once(url: str) -> int:
     try:
         print(pipeline.process({"url": url}))
@@ -747,6 +777,11 @@ def main():
         help="Prova il provider locale senza Telegram, senza fetch e senza scrivere file",
     )
     parser.add_argument(
+        "--smoke-long",
+        action="store_true",
+        help="Prova un thread sintetico lungo, senza Telegram e senza fetch",
+    )
+    parser.add_argument(
         "--retry-failed",
         action="store_true",
         help="Conta i job in .cache/failed. Senza --execute non scrive nulla",
@@ -762,9 +797,9 @@ def main():
         help="Con --retry-failed, accetta i job originali in coda",
     )
     args = parser.parse_args()
-    selected = [args.check, bool(args.process), args.smoke_provider, args.retry_failed]
+    selected = [args.check, bool(args.process), args.smoke_provider, args.smoke_long, args.retry_failed]
     if sum(selected) > 1:
-        parser.error("Scegli un solo comando tra --check, --process, --smoke-provider e --retry-failed")
+        parser.error("Scegli un solo comando tra --check, --process, --smoke-provider, --smoke-long e --retry-failed")
     if args.dry_run and not args.retry_failed:
         parser.error("--dry-run richiede --retry-failed")
     if args.execute and not args.retry_failed:
@@ -776,6 +811,8 @@ def main():
         sys.exit(0 if check_setup() else 1)
     if args.smoke_provider:
         sys.exit(smoke_provider())
+    if args.smoke_long:
+        sys.exit(smoke_long())
     if args.retry_failed:
         sys.exit(retry_failed_cli(execute=args.execute))
     if args.process:
