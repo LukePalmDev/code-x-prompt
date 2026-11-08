@@ -14,7 +14,9 @@ X post URL
     ▼ pipeline.py                         every deterministic step
     │
     ├── fetch-x.py  →  thread text (FxTwitter; optional twscrape fallback)
-    ├── Claude Code CLI  →  extraction + translation only (no tools, JSON schema)
+    ├── extraction + translation only (no tools, one JSON schema)
+    │     ├── Claude Code CLI   default; Sonnet fallback stays inside Claude
+    │     └── Ollama /api/chat  optional; never falls back to Claude
     │
     └── writes and verifies in output_dir/
             └── {Topic}/
@@ -40,7 +42,8 @@ prompt-x-output/
 ## Prerequisites
 
 - **Python 3.9+** for the minimal bot; **3.11+** for all optional dependencies
-- **[Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code)** — `npm install -g @anthropic-ai/claude-code`
+- **[Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code)** — `npm install -g @anthropic-ai/claude-code` (default provider)
+- **Ollama on localhost** only if you later set `provider: ollama`. Not used until then. Do not pull a model for this repo; point `ollama.model` at a tag already installed.
 - An **X (Twitter) account** only if the optional authenticated fallback is needed
 - A **Telegram bot token** from [@BotFather](https://t.me/BotFather) *(only to run the bot — the pipeline can also be run manually)*
 
@@ -51,7 +54,7 @@ prompt-x-output/
 | `TELEGRAM_BOT_TOKEN` | Bot only | `.env`, copied from `.env.example`. Do not commit `.env`. |
 | `output_dir` | Always | `config.yaml`, copied from `config.yaml.example`. This is not an environment variable. |
 
-Claude Code must be logged in (`claude auth login`). The default fetch uses the public FxTwitter API and needs no X API key, bearer token, or cookie. `twscrape` reads browser cookies only when that package is installed and the public fetch fails.
+Claude Code must be logged in (`claude auth login`) while `provider` is unset or `claude`. The default fetch uses the public FxTwitter API and needs no X API key, bearer token, or cookie. `twscrape` reads browser cookies only when that package is installed and the public fetch fails. Ollama is not contacted unless `config.yaml` sets `provider: ollama`.
 
 ## Setup
 
@@ -102,9 +105,12 @@ Authenticate Claude with `claude auth login`, then check the local setup:
 .venv/bin/python prompt-listener.py --check
 ```
 
-This checks the token's presence, output directory and Claude login without
-sending Telegram messages or running an extraction. A successful login check
-does not guarantee available session quota. Public FxTwitter fetching needs no
+This checks the token's presence, output directory and the configured provider
+without sending Telegram messages or running an extraction. The default provider
+check is Claude login. After `provider: ollama` it only sends `GET /api/tags`
+to localhost and checks that `ollama.model` is already listed; it does not
+generate, pull a model, or call Claude. A successful Claude login check does
+not guarantee available session quota. Public FxTwitter fetching needs no
 X credentials; twscrape is used only when installed and the public fetch fails.
 
 ### 5. Start the bot
@@ -135,8 +141,9 @@ launchctl print gui/$(id -u)/com.promptx.listener
 tail -n 100 logs/listener.log
 ```
 
-Send `/stato` to the bot to check Claude login, the output folder, FxTwitter,
-the queue and the last success or error.
+Send `/stato` to the bot to check the active provider (Claude login, or the
+local Ollama tag), the output folder, FxTwitter, the queue and the last
+success or error. The reply text for a finished post stays `✅ Fatto. N prompt in 'Topic'.`
 
 Reliability:
 
@@ -208,7 +215,7 @@ Inside a Claude Code session, pasting an X link makes Claude run this command
 | File | Description |
 |------|-------------|
 | `fetch-x.py` | Fetches thread text via FxTwitter (twscrape fallback) |
-| `pipeline.py` | Fetch, extraction with Claude, folders, files and verification |
+| `pipeline.py` | Fetch, extraction (Claude or optional Ollama), folders, files and verification |
 | `prompt-listener.py` | Telegram bot, persistent queue, notifications, `/stato` |
 | `CLAUDE.md` | Instructions for interactive Claude Code sessions |
 | `config.yaml` | Your local config (gitignored) |
@@ -227,6 +234,62 @@ Inside a Claude Code session, pasting an X link makes Claude run this command
 | Key | Description | Default |
 |-----|-------------|---------|
 | `output_dir` | Where to save extracted prompts | *(required)* |
+| `provider` | `claude` or `ollama` | `claude` when the key is absent |
+| `ollama.model` | Exact local tag from `ollama list`. Required only for `provider: ollama`. No model is pulled. | *(none)* |
+| `ollama.base_url` | Loopback Ollama. Remote hosts are rejected. | `http://127.0.0.1:11434` |
+| `ollama.num_ctx` | Sent on every chat request. Values above 8192, including the model-card size 262144, are rejected. | `4096` |
+| `ollama.num_predict` | Maximum tokens to generate. Must leave at least 512 tokens of input inside `num_ctx`. | `2048` |
+| `ollama.think` | Documented `POST /api/chat` boolean. `false` asks for no thinking trace. A missing key still sends `false`. | `false` |
+| `ollama.timeout_seconds` | One request, including time queued behind another client of the same server. | `240` |
+| `ollama.keep_alive` | Per-request keep-alive. `0` is rejected so this client does not unload a shared model. | `5m` |
+| `ollama.temperature` | Sampling temperature. | `0` |
+
+## Optional local Ollama
+
+The running service stays on Claude until `config.yaml` in the service clone sets `provider: ollama`. Copying `config.yaml.example` does not switch provider: the Ollama block is commented. Do not change the Ollama service, its environment, or the models it has loaded. Trader (gaming-classifier) already uses the same server and the same tag.
+
+Verified local tag to copy into `ollama.model` when you enable it:
+
+```yaml
+provider: ollama
+ollama:
+  base_url: "http://127.0.0.1:11434"
+  model: "gemma4:12b-it-q4_K_M"
+  timeout_seconds: 240
+  num_ctx: 4096
+  num_predict: 2048
+  temperature: 0
+  think: false
+  keep_alive: "5m"
+```
+
+`gemma4:12b-it-q4_K_M` is about 8.0GB (Q4_K_M). On the Mac mini M4 with 16GB of memory, a local smoke at `num_ctx` 4096 left about 14% RAM free, took about 35 seconds including the cold load, and generated at about 23 tokens per second. That measurement is why 4096 is sent explicitly. A missing `num_ctx` would otherwise follow the model default, which previously truncated a classifier at 4K and whose card context is 262144, too large for this machine. Posts that do not fit the budget fail before the request. The reply is discarded when generation hits `num_predict`, when `prompt_eval_count` fills `num_ctx`, or when the JSON does not match the schema. Nothing is shortened and then saved.
+
+`think` is the [Ollama chat field](https://docs.ollama.com/api/chat): `true` requests a thinking trace, `false` requests none, and omitting it on the wire uses the model default. This model's default is thinking on, so every extraction sends `false` unless `ollama.think` is `true`. The schema goes in `format`. `tools` is not sent. Structured output uses the same system prompt and the same `topic` / `prompts` object as Claude.
+
+This process makes one Ollama call at a time and waits out a manual run on the same pipeline lock. It cannot reserve the server against Trader. Timeouts, connection failures, and a busy runner are retried (5s, then 20s, three attempts in all) and stay retryable by the Telegram queue. Invalid JSON is retried the same way and then becomes a permanent error. None of those paths call Claude.
+
+### Offline checks, no Telegram
+
+Regression tests mock Ollama and do not use the network, Telegram, Claude, or Ollama:
+
+```bash
+.venv/bin/python -m unittest discover -s tests -v
+```
+
+`--check` does not send Telegram and does not generate. With the default config it still checks Claude login. After `provider: ollama` it only calls `GET http://127.0.0.1:11434/api/tags`.
+
+```bash
+.venv/bin/python prompt-listener.py --check
+```
+
+Model smoke, only after the service config sets `provider: ollama` and the verified tag. It does not create the Telegram bot, so a configured token cannot be used to send. It does not fetch X, write prompt files, or update `processed.json`. Exit `0` is a valid local JSON extraction. Exit `2` means the provider is still Claude and neither Claude nor Ollama was called. Exit `1` is a local failure, also with no Telegram send.
+
+```bash
+.venv/bin/python prompt-listener.py --smoke-provider
+```
+
+Leave the LaunchAgent on Claude until that command has been run on the mini and the result is accepted. Deploy of this code with the existing `config.yaml` does not change the provider.
 
 ## Notes
 

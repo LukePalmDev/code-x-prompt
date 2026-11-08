@@ -15,6 +15,9 @@ Daily use:
 
 Manual run (same pipeline, no Telegram):
   .venv/bin/python prompt-listener.py --process <url>
+
+Local provider probe (no Telegram, no fetch, no output files):
+  .venv/bin/python prompt-listener.py --smoke-provider
 """
 
 import argparse
@@ -238,6 +241,29 @@ def worker(bot, wake: threading.Event) -> None:
 
 # ─── health checks ────────────────────────────────────────────────────────────
 
+def provider_label() -> str:
+    try:
+        if pipeline.provider_settings()["provider"] == "ollama":
+            return "Ollama"
+    except pipeline.PipelineError:
+        return "Provider"
+    return "Claude"
+
+
+def check_provider():
+    """Check the configured provider only. Ollama never falls through to Claude."""
+    try:
+        settings = pipeline.provider_settings()
+    except pipeline.PipelineError as exc:
+        raise ValueError(str(exc)) from None
+    if settings["provider"] == "ollama":
+        try:
+            return pipeline.check_ollama(settings)
+        except pipeline.PipelineError as exc:
+            raise ValueError(str(exc)) from None
+    return check_claude()
+
+
 def check_claude():
     try:
         result = subprocess.run(
@@ -311,7 +337,7 @@ def status_report() -> str:
     lines = [
         f"{'✅' if ok else '❌'} {label}: {detail}"
         for ok, label, detail in run_checks([
-            ("Claude", check_claude), ("Output", check_output), ("X/FxTwitter", check_fxtwitter),
+            (provider_label(), check_provider), ("Output", check_output), ("X/FxTwitter", check_fxtwitter),
             ("Runtime", check_runtime),
         ])
     ]
@@ -340,7 +366,7 @@ def check_token():
 def check_setup() -> bool:
     """Read-only startup diagnostics; never print the bot token."""
     results = run_checks([
-        ("Telegram", check_token), ("Claude", check_claude), ("Output", check_output), ("Runtime", check_runtime),
+        ("Telegram", check_token), (provider_label(), check_provider), ("Output", check_output), ("Runtime", check_runtime),
     ])
     for ok, label, detail in results:
         print(f"{'OK ' if ok else 'ERR'} {label}: {detail}", file=sys.stdout if ok else sys.stderr, flush=True)
@@ -382,6 +408,32 @@ def watchdog(bot) -> None:
 
 
 # ─── entry points ─────────────────────────────────────────────────────────────
+
+def smoke_provider() -> int:
+    """Probe local structured output. Never constructs the Telegram bot."""
+    try:
+        settings = pipeline.provider_settings()
+    except pipeline.PipelineError as exc:
+        print(f"Errore: {exc}", file=sys.stderr)
+        return 1
+    if settings["provider"] != "ollama":
+        print(
+            "Provider claude: smoke locale non eseguito. Nessuna chiamata a Claude o Telegram.",
+            file=sys.stderr,
+        )
+        return 2
+    try:
+        extraction = pipeline.smoke_local_extraction()
+    except pipeline.PipelineError as exc:
+        print(f"Errore: {exc}", file=sys.stderr)
+        return 1
+    print(
+        f"Smoke Ollama ok: {len(extraction['prompts'])} prompt, topic {extraction['topic']!r}, "
+        f"modello {settings['model']}, num_ctx {settings['num_ctx']}, think {str(settings['think']).lower()}.",
+        flush=True,
+    )
+    return 0
+
 
 def process_once(url: str) -> int:
     try:
@@ -441,7 +493,7 @@ def run_bot() -> None:
             send(bot, msg.chat.id, "⏳ Questo post è già in coda.", msg.message_id)
 
     pending = len(queued_jobs())
-    log.info("Bot started. Project: %s. Queue: %d", PROJECT_DIR, pending)
+    log.info("Bot started. Project: %s. Queue: %d. Provider: %s", PROJECT_DIR, pending, provider_label())
     for ok, label, detail in run_checks([("Runtime", check_runtime)]):
         if not ok:
             log.error("%s: %s", label, detail)
@@ -460,10 +512,17 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--check", action="store_true", help="Verifica configurazione senza avviare il bot")
     parser.add_argument("--process", metavar="URL", help="Elabora un link senza Telegram")
+    parser.add_argument(
+        "--smoke-provider",
+        action="store_true",
+        help="Prova il provider locale senza Telegram, senza fetch e senza scrivere file",
+    )
     args = parser.parse_args()
     setup_logging()
     if args.check:
         sys.exit(0 if check_setup() else 1)
+    if args.smoke_provider:
+        sys.exit(smoke_provider())
     if args.process:
         sys.exit(process_once(args.process))
     if not BOT_TOKEN:

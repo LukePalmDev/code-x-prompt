@@ -27,9 +27,11 @@ Link X su Telegram (@xpromptbot)
   -> prompt-listener.py   coda persistente .cache/queue/, notifiche, /stato
   -> pipeline.py          tutti i passi deterministici
      -> fetch-x.py        FxTwitter API (primaria) / twscrape (fallback)
-     -> Claude CLI        solo estrazione + traduzione: nessuno strumento,
-                          output JSON con schema fisso, cartella di lavoro
-                          fuori dal progetto (questo file non viene letto)
+     -> estrazione + traduzione, nessuno strumento, schema JSON fisso
+        Claude CLI        predefinito; cartella di lavoro fuori dal progetto
+                          (questo file non viene letto). Riserva Sonnet solo qui.
+        Ollama            opzionale (`provider: ollama`): POST /api/chat senza
+                          tools, stesso schema, nessun fallback su Claude.
      -> scrittura e verifica dei file in {output_dir}/{Topic}/Inglese|Italiano
 ```
 
@@ -43,7 +45,13 @@ Regole garantite dal codice in `pipeline.py`:
 - i file completi non vengono mai sovrascritti;
 - successo solo dopo la verifica dei file in entrambe le lingue (i file iCloud
   solo-cloud sono verificati per dimensione);
-- modello: quello di `.claude/settings.json`, poi Sonnet come riserva.
+- modello Claude: quello di `.claude/settings.json`, poi Sonnet come riserva;
+- provider predefinito: Claude. `provider: ollama` è opt-in nel `config.yaml`
+  del clone di servizio e non va attivato finché `--smoke-provider` non è
+  stato accettato sulla mini. Il tag non è implicito: l'esempio verificato è
+  `gemma4:12b-it-q4_K_M`. Ogni richiesta invia `num_ctx` (default 4096, massimo
+  8192, mai 262144) e `think: false`. Trader condivide lo stesso Ollama: non
+  cambiare la configurazione globale del server e non scaricare altri modelli.
 
 Le istruzioni di estrazione per Claude sono `SYSTEM_PROMPT` in `pipeline.py`.
 
@@ -84,6 +92,13 @@ Dal clone di servizio (`cd ~/Developer/code-x-prompt`):
 launchctl print gui/$(id -u)/com.promptx.listener
 launchctl kickstart -k gui/$(id -u)/com.promptx.listener
 tail -n 100 logs/listener.log
+```
+
+Smoke del provider locale, senza Telegram, senza fetch e senza scrivere file
+(exit 2 finché il provider resta Claude; non chiama né Claude né Ollama):
+
+```bash
+.venv/bin/python prompt-listener.py --smoke-provider
 ```
 
 Test, dalla cartella sorgente (usano l'ambiente Python del servizio):
