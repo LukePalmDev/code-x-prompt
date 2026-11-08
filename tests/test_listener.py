@@ -182,6 +182,21 @@ class QueueTests(unittest.TestCase):
             self.assertEqual(listener.smoke_provider(), 0)
         smoke.assert_called_once_with()
 
+    def test_smoke_long_does_not_construct_telegram_or_fetch(self):
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(listener.pipeline, "PROJECT_DIR", Path(directory)), \
+                patch.object(listener.telebot, "TeleBot", side_effect=AssertionError("telegram")), \
+                patch.object(listener.subprocess, "run", side_effect=AssertionError("claude")), \
+                patch.object(listener.pipeline.urllib.request, "urlopen", side_effect=AssertionError("ollama")):
+            self.assertEqual(listener.smoke_long(), 2)
+        result = {"segments": 4, "prompts": 4, "topic": "Note", "model": "gemma4:12b-it-q4_K_M", "num_ctx": 8192, "num_predict": 2048}
+        with patch.object(listener.pipeline, "provider_settings", return_value={"provider": "ollama"}), \
+                patch.object(listener.pipeline, "smoke_long_extraction", return_value=result) as smoke, \
+                patch.object(listener.telebot, "TeleBot", side_effect=AssertionError("telegram")), \
+                patch.object(listener.pipeline, "fetch_thread", side_effect=AssertionError("fetch")):
+            self.assertEqual(listener.smoke_long(), 0)
+        smoke.assert_called_once_with()
+
 
 class RuntimeTests(unittest.TestCase):
     def test_project_in_icloud_folder_is_rejected(self):

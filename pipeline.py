@@ -84,6 +84,9 @@ OLLAMA_MAX_RESPONSE_BYTES = 1_000_000
 # rejected instead of being truncated inside the context window.
 OLLAMA_CHARS_PER_TOKEN = 3
 OLLAMA_TEMPLATE_TOKENS = 128
+# Source tokens per call. Half of num_predict leaves room for the Italian JSON
+# without raising the configured generation cap. Calls stay sequential.
+OLLAMA_MAX_SEGMENTS = 24
 _OLLAMA_LOCK = threading.Lock()
 _MODEL_TAG = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$")
 _KEEP_ALIVE = re.compile(r"^([1-9]\d*)([smh])$")
@@ -161,6 +164,59 @@ EXTRACTION_SCHEMA = {
     "additionalProperties": False,
 }
 
+# Used only after a full bilingual call hits num_predict. Smaller JSON, same rules.
+ENGLISH_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "topic": {"type": "string"},
+        "prompts": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "title_en": {"type": "string"},
+                    "prompt_en": {"type": "string"},
+                },
+                "required": ["title_en", "prompt_en"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["topic", "prompts"],
+    "additionalProperties": False,
+}
+TRANSLATION_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "title_it": {"type": "string"},
+        "prompt_it": {"type": "string"},
+    },
+    "required": ["title_it", "prompt_it"],
+    "additionalProperties": False,
+}
+ENGLISH_SYSTEM = """\
+Estrai i prompt dal segmento e restituiscili tramite l'output strutturato.
+
+Regole:
+- Un elemento per ogni prompt completo, nell'ordine originale.
+- prompt_en: testo originale verbatim e completo. Non riassumere e non troncare.
+- title_en: titolo inglese breve.
+- Ignora il testo segnato come contesto già trattato.
+- topic: nome descrittivo in italiano in Pascal-Kebab-Case, senza suffissi numerici.
+- Se non ci sono prompt completi, restituisci prompts vuoto.
+"""
+TRANSLATION_SYSTEM = """\
+Traduci il prompt in italiano tramite l'output strutturato.
+
+- title_it: traduzione del titolo, breve.
+- prompt_it: traduzione completa. Non troncare e non aggiungere commenti.
+- Lascia invariati placeholder e token come [topic], {variable} e <context>.
+"""
+SEGMENT_NOTE = (
+    "Segmento del post originale, limiti inclusi. Estrai solo i prompt completi "
+    "presenti qui; non riassumere e non completare testo assente.\n\n"
+)
+
 
 class PipelineError(Exception):
     """transient=True means retrying later may succeed (network, limits, outages)."""
@@ -168,6 +224,13 @@ class PipelineError(Exception):
     def __init__(self, message: str, transient: bool = False):
         super().__init__(message)
         self.transient = transient
+
+
+class BudgetStop(PipelineError):
+    """Repeating this same request would hit the context or the output cap again."""
+
+    def __init__(self, message: str):
+        super().__init__(message, transient=False)
 
 
 def is_transient_error(message: str) -> bool:
@@ -472,9 +535,10 @@ def validate_extraction(extraction) -> dict:
     return extraction
 
 
-def extraction_request(source: str, existing: list) -> str:
+def extraction_request(source: str, existing: list, note: str = "") -> str:
     return (
         f"Cartelle esistenti: {', '.join(existing) or 'nessuna'}\n\n"
+        f"{note}"
         f"Post e thread X:\n\n{source}"
     )
 
@@ -488,39 +552,163 @@ def _clip(text: str, limit: int = 400) -> str:
     return text if len(text) <= limit else text[:limit] + "…"
 
 
-def assert_ollama_context(source: str, existing: list, settings: dict) -> None:
-    """Reject a post that cannot fit. Never truncate it to the context window."""
-    incoming = _estimate_tokens(SYSTEM_PROMPT) + _estimate_tokens(extraction_request(source, existing))
-    incoming += OLLAMA_TEMPLATE_TOKENS
-    room = settings["num_ctx"] - settings["num_predict"]
-    if incoming <= room:
-        return
-    raise PipelineError(
-        f"Il testo non entra in num_ctx={settings['num_ctx']} con num_predict={settings['num_predict']} "
-        f"(stima {incoming} token di input, spazio {room}). "
-        "Nessun troncamento e nessun fallback su Claude. "
-        f"Accorcia il thread oppure alza num_ctx fino a {OLLAMA_NUM_CTX_MAX}, "
-        f"mai fino a {OLLAMA_MODEL_CONTEXT_REFUSAL}.",
-        transient=False,
+def ollama_segment_budget(settings: dict, existing: list) -> int:
+    """Tokens of source text one call may carry, at the configured num_ctx and num_predict."""
+    overhead = (
+        _estimate_tokens(SYSTEM_PROMPT)
+        + _estimate_tokens(extraction_request("", existing, SEGMENT_NOTE))
+        + OLLAMA_TEMPLATE_TOKENS
     )
+    room = settings["num_ctx"] - settings["num_predict"] - overhead
+    if room < 128:
+        raise PipelineError(
+            f"num_ctx={settings['num_ctx']} con num_predict={settings['num_predict']} "
+            "non lascia spazio al testo. Nessun troncamento e nessun fallback su Claude.",
+            transient=False,
+        )
+    # Keep the source smaller than the JSON budget so a bilingual echo can finish
+    # inside the configured num_predict. This does not raise that cap.
+    return min(room, max(128, settings["num_predict"] // 2))
 
 
-def ollama_chat_body(source: str, existing: list, settings: dict) -> dict:
+def split_pieces(source: str) -> list:
+    """Cover source exactly once, breaking on tweet, paragraph, then line boundaries."""
+    if not source:
+        return [(0, 0)]
+    pieces = []
+    last = 0
+    for match in re.finditer(r"\n\n---\n\n|\n\n|\n", source):
+        end = match.end()
+        if end > last:
+            pieces.append((last, end))
+        last = end
+    if last < len(source):
+        pieces.append((last, len(source)))
+    return pieces or [(0, len(source))]
+
+
+def plan_segments(source: str, existing: list, settings: dict) -> list:
+    """Slices of the original text. Joining them reproduces the source."""
+    budget = ollama_segment_budget(settings, existing)
+    pieces = split_pieces(source)
+    for start, end in pieces:
+        if _estimate_tokens(source[start:end]) > budget:
+            raise PipelineError(
+                "Un blocco senza un confine di riga non entra nel budget "
+                f"(num_ctx={settings['num_ctx']}, num_predict={settings['num_predict']}, "
+                f"budget {budget} token). Nessun troncamento e nessun fallback su Claude. "
+                f"Non alzare il contesto fino a {OLLAMA_MODEL_CONTEXT_REFUSAL}.",
+                transient=False,
+            )
+    segments = []
+    buf_start = None
+    buf_end = None
+    for start, end in pieces:
+        if buf_start is None:
+            buf_start, buf_end = start, end
+            continue
+        if _estimate_tokens(source[buf_start:end]) <= budget:
+            buf_end = end
+            continue
+        segments.append((buf_start, buf_end))
+        buf_start, buf_end = start, end
+    if buf_start is not None:
+        segments.append((buf_start, buf_end))
+    if len(segments) > OLLAMA_MAX_SEGMENTS:
+        raise PipelineError(
+            f"Il post richiederebbe più di {OLLAMA_MAX_SEGMENTS} chiamate locali. "
+            "Nessun troncamento e nessun fallback su Claude.",
+            transient=False,
+        )
+    if not segments:
+        return [(0, 0)]
+    if segments[0][0] != 0 or segments[-1][1] != len(source):
+        raise PipelineError("Segmenti non allineati al testo originale.", transient=False)
+    for left, right in zip(segments, segments[1:]):
+        if left[1] != right[0]:
+            raise PipelineError("Segmenti non contigui.", transient=False)
+    return segments
+
+
+def _normalize_prompt(text: str) -> str:
+    return " ".join(text.split()).lower()
+
+
+def prefer_complete_prompts(prompts: list) -> list:
+    """Drop an exact duplicate or a boundary fragment of a longer verbatim prompt."""
+    seen = set()
+    unique = []
+    for prompt in prompts:
+        key = _normalize_prompt(prompt["prompt_en"])
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(prompt)
+    drop = set()
+    keys = [_normalize_prompt(prompt["prompt_en"]) for prompt in unique]
+    for index, key in enumerate(keys):
+        for other in keys:
+            if other != key and (other.startswith(key) or other.endswith(key)) and len(other) >= len(key) + 20:
+                drop.add(index)
+                break
+    return [prompt for index, prompt in enumerate(unique) if index not in drop]
+
+
+def merge_extractions(base: dict, extra: dict) -> dict:
+    topic = str(base.get("topic") or "").strip() or str(extra.get("topic") or "").strip()
+    return {"topic": topic, "prompts": prefer_complete_prompts(list(base.get("prompts") or []) + list(extra.get("prompts") or []))}
+
+
+def halve_text(text: str):
+    pieces = split_pieces(text)
+    if len(pieces) < 2:
+        return None
+    half = len(text) / 2
+    cut = min(pieces[:-1], key=lambda item: abs(item[1] - half))[1]
+    if cut <= 0 or cut >= len(text):
+        return None
+    return text[:cut], text[cut:]
+
+
+def predict_for_single_prompt(settings: dict, prompt_en: str) -> int:
+    """Configured num_predict, or a higher value only when one prompt needs it.
+
+    The ceiling is OLLAMA_NUM_PREDICT_MAX and the room left in num_ctx. Never
+    the model-card context.
+    """
+    needed = _estimate_tokens(prompt_en) + 48
+    instruction = "Traduci in italiano il prompt seguente, senza troncare.\n\n"
+    incoming = _estimate_tokens(TRANSLATION_SYSTEM) + _estimate_tokens(instruction + prompt_en) + OLLAMA_TEMPLATE_TOKENS
+    room = settings["num_ctx"] - incoming - 64
+    ceiling = min(OLLAMA_NUM_PREDICT_MAX, room)
+    chosen = min(max(settings["num_predict"], needed), ceiling)
+    if chosen < needed or chosen < OLLAMA_NUM_PREDICT_MIN:
+        raise PipelineError(
+            f"Un singolo prompt non entra in num_predict massimo {OLLAMA_NUM_PREDICT_MAX} "
+            f"dentro num_ctx={settings['num_ctx']} (stima {needed} token). "
+            "Nessun troncamento e nessun fallback su Claude. "
+            f"Non usare {OLLAMA_MODEL_CONTEXT_REFUSAL}.",
+            transient=False,
+        )
+    return chosen
+
+
+def ollama_chat_body(source: str, existing: list, settings: dict, schema=None, system: str = None, num_predict: int = None, note: str = "") -> dict:
     """POST /api/chat body. tools is omitted on purpose; format carries the schema."""
     return {
         "model": settings["model"],
         "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": extraction_request(source, existing)},
+            {"role": "system", "content": SYSTEM_PROMPT if system is None else system},
+            {"role": "user", "content": extraction_request(source, existing, note)},
         ],
         "stream": False,
         "think": settings["think"],
-        "format": EXTRACTION_SCHEMA,
+        "format": EXTRACTION_SCHEMA if schema is None else schema,
         "keep_alive": settings["keep_alive"],
         "options": {
             "temperature": settings["temperature"],
             "num_ctx": settings["num_ctx"],
-            "num_predict": settings["num_predict"],
+            "num_predict": settings["num_predict"] if num_predict is None else num_predict,
         },
     }
 
@@ -590,41 +778,86 @@ def parse_structured_text(content: str) -> dict:
     return validate_extraction(parsed)
 
 
-def parse_ollama_chat(payload: dict, settings: dict) -> dict:
+def _load_model_json(content: str) -> dict:
+    text = content.strip()
+    fence = re.search(r"```(?:json)?\s*(.*?)```", text, re.DOTALL)
+    if fence:
+        text = fence.group(1).strip()
+    try:
+        parsed = json.loads(text)
+    except ValueError:
+        start, end = text.find("{"), text.rfind("}")
+        if start < 0 or end <= start:
+            raise ValueError("JSON assente.")
+        try:
+            parsed = json.loads(text[start:end + 1])
+        except ValueError as exc:
+            raise ValueError("JSON non parsabile.") from exc
+    if not isinstance(parsed, dict):
+        raise ValueError("JSON non è un oggetto.")
+    return parsed
+
+
+def parse_ollama_chat(payload: dict, settings: dict, kind: str = "full", prompt_en: str = "") -> dict:
     message = payload.get("message")
     if not isinstance(message, dict):
         raise ValueError("message assente.")
     if message.get("tool_calls"):
         raise ValueError("tool_calls presenti; la richiesta non invia tools.")
+    predict = payload.get("num_predict_sent") or settings["num_predict"]
     if payload.get("done_reason") == "length":
-        raise ValueError(f"generazione interrotta da num_predict={settings['num_predict']}.")
+        raise BudgetStop(f"generazione interrotta da num_predict={predict}.")
     evaluated = payload.get("prompt_eval_count")
     if isinstance(evaluated, int) and evaluated >= settings["num_ctx"]:
-        raise ValueError(f"prompt_eval_count={evaluated} ha riempito num_ctx={settings['num_ctx']}.")
+        raise BudgetStop(f"prompt_eval_count={evaluated} ha riempito num_ctx={settings['num_ctx']}.")
     content = message.get("content")
     if not isinstance(content, str) or not content.strip():
         if message.get("thinking"):
             raise ValueError("solo thinking e nessun JSON; ollama.think deve restare false.")
         raise ValueError("contenuto vuoto.")
-    return parse_structured_text(content)
+    if kind == "full":
+        return parse_structured_text(content)
+    parsed = _load_model_json(content)
+    if kind == "english":
+        prompts = parsed.get("prompts")
+        if not isinstance(prompts, list):
+            raise ValueError("Output strutturato assente.")
+        cleaned = []
+        for number, prompt in enumerate(prompts, 1):
+            if not isinstance(prompt, dict) or not str(prompt.get("title_en") or "").strip() or not str(prompt.get("prompt_en") or "").strip():
+                raise ValueError(f"Prompt {number} incompleto.")
+            cleaned.append({"title_en": prompt["title_en"], "prompt_en": prompt["prompt_en"]})
+        return {"topic": str(parsed.get("topic") or "").strip(), "prompts": cleaned}
+    title = str(parsed.get("title_it") or "").strip()
+    translated = str(parsed.get("prompt_it") or "").strip()
+    if not title or not translated:
+        raise ValueError("Traduzione incompleta.")
+    if len(translated) < MIN_TRANSLATION_RATIO * len(prompt_en.strip()):
+        raise ValueError("Traduzione troncata.")
+    return {"title_it": title, "prompt_it": translated}
 
 
-def run_ollama(source: str, existing: list, settings: dict) -> dict:
-    """One local extraction. The lock keeps this process to a single Ollama call."""
-    body = ollama_chat_body(source, existing, settings)
+def run_ollama(source: str, existing: list, settings: dict, schema=None, system: str = None, num_predict: int = None, note: str = "", kind: str = "full", prompt_en: str = "") -> dict:
+    """One local call. The lock keeps this process to a single Ollama request."""
+    body = ollama_chat_body(source, existing, settings, schema=schema, system=system, num_predict=num_predict, note=note)
     with _OLLAMA_LOCK:
         payload = ollama_http(settings, "POST", "/api/chat", body)
+    payload["num_predict_sent"] = body["options"]["num_predict"]
     try:
-        return parse_ollama_chat(payload, settings)
+        return parse_ollama_chat(payload, settings, kind=kind, prompt_en=prompt_en)
+    except BudgetStop:
+        raise
     except ValueError as exc:
         raise PipelineError(f"Risposta di Ollama non valida: {exc}", transient=True) from exc
 
 
-def extract_with_ollama(source: str, existing: list, settings: dict) -> dict:
-    assert_ollama_context(source, existing, settings)
+def run_ollama_attempts(source: str, existing: list, settings: dict, **kwargs) -> dict:
+    """Retry a transient answer. A budget stop is not sent again."""
     for attempt in range(1, MAX_EXTRACTION_ATTEMPTS + 1):
         try:
-            extraction = run_ollama(source, existing, settings)
+            return run_ollama(source, existing, settings, **kwargs)
+        except BudgetStop:
+            raise
         except PipelineError as exc:
             log.warning(
                 "Ollama attempt %d/%d (%s, num_ctx=%s) failed: %s",
@@ -635,12 +868,88 @@ def extract_with_ollama(source: str, existing: list, settings: dict) -> dict:
                     raise PipelineError(str(exc), transient=False) from exc
                 raise
             time.sleep(OLLAMA_RETRY_DELAYS[attempt - 1])
-        else:
-            log.info(
-                "Extracted %d prompts with ollama model %s (num_ctx=%s, think=%s)",
-                len(extraction["prompts"]), settings["model"], settings["num_ctx"], settings["think"],
+
+
+def extract_piecewise(text: str, existing: list, settings: dict) -> dict:
+    """English list, then one translation per prompt. Used when one block still overflows."""
+    try:
+        english = run_ollama_attempts(
+            text, existing, settings, schema=ENGLISH_SCHEMA, system=ENGLISH_SYSTEM, kind="english", note=SEGMENT_NOTE,
+        )
+    except BudgetStop as exc:
+        raise PipelineError(
+            f"{exc} Nessun troncamento e nessun fallback su Claude.",
+            transient=False,
+        ) from exc
+    prompts = []
+    for item in english["prompts"]:
+        predict = predict_for_single_prompt(settings, item["prompt_en"])
+        try:
+            translated = run_ollama_attempts(
+                item["prompt_en"], [], settings,
+                schema=TRANSLATION_SCHEMA, system=TRANSLATION_SYSTEM,
+                num_predict=predict, kind="translation", prompt_en=item["prompt_en"],
+                note="Traduci in italiano il prompt seguente, senza troncare.\n\n",
             )
-            return extraction
+        except BudgetStop as exc:
+            raise PipelineError(
+                f"{exc} Nessun troncamento e nessun fallback su Claude.",
+                transient=False,
+            ) from exc
+        prompts.append({
+            "title_en": item["title_en"], "prompt_en": item["prompt_en"],
+            "title_it": translated["title_it"], "prompt_it": translated["prompt_it"],
+        })
+    return {"topic": english.get("topic") or "", "prompts": prompts}
+
+
+def extract_text(text: str, existing: list, settings: dict, note: str = "") -> dict:
+    try:
+        return run_ollama_attempts(text, existing, settings, note=note)
+    except BudgetStop:
+        parts = halve_text(text)
+        if parts is None:
+            return extract_piecewise(text, existing, settings)
+        return merge_extractions(
+            extract_text(parts[0], existing, settings, note),
+            extract_text(parts[1], existing, settings, note),
+        )
+
+
+def extract_with_ollama(source: str, existing: list, settings: dict) -> dict:
+    segments = plan_segments(source, existing, settings)
+    log.info(
+        "Ollama segments=%d num_ctx=%s num_predict=%s chars=%d",
+        len(segments), settings["num_ctx"], settings["num_predict"], len(source),
+    )
+    merged = {"topic": "", "prompts": []}
+    previous = ""
+    for index, (start, end) in enumerate(segments, 1):
+        text = source[start:end]
+        note = ""
+        if len(segments) > 1:
+            overlap = ""
+            if previous:
+                candidate = f"Contesto già trattato, non estrarre di nuovo:\n{previous}\n\n"
+                headed = f"Segmento {index}/{len(segments)} caratteri [{start}:{end}).\n{candidate}{SEGMENT_NOTE}"
+                incoming = _estimate_tokens(SYSTEM_PROMPT) + _estimate_tokens(extraction_request(text, existing, headed)) + OLLAMA_TEMPLATE_TOKENS
+                if incoming <= settings["num_ctx"] - settings["num_predict"]:
+                    overlap = candidate
+            note = f"Segmento {index}/{len(segments)} caratteri [{start}:{end}).\n{overlap}{SEGMENT_NOTE}"
+        log.info("Ollama segment %d/%d chars [%d:%d)", index, len(segments), start, end)
+        merged = merge_extractions(merged, extract_text(text, existing, settings, note))
+        previous = text[-400:] if len(text) > 400 else text
+        newline = previous.find("\n")
+        if newline != -1:
+            previous = previous[newline + 1:]
+    if not str(merged["topic"]).strip():
+        merged["topic"] = "Prompt"
+    extraction = validate_extraction(merged)
+    log.info(
+        "Extracted %d prompts with ollama model %s (num_ctx=%s, think=%s, segments=%d)",
+        len(extraction["prompts"]), settings["model"], settings["num_ctx"], settings["think"], len(segments),
+    )
+    return extraction
 
 
 def check_ollama(settings: dict = None) -> str:
@@ -666,6 +975,52 @@ def check_ollama(settings: dict = None) -> str:
             transient=False,
         )
     return f"locale {settings['base_url']}, modello {tag}, num_ctx {settings['num_ctx']}, think {str(settings['think']).lower()}"
+
+
+def smoke_long_source():
+    """Synthetic thread long enough to need more than one segment at 4096 and at 8192.
+
+    The planted lines are the only prompts. No personal data and no network.
+    """
+    planted = [
+        "Prompt: Write a two-sentence thank-you note to [name] for help with {task} one.",
+        "Prompt: Write a two-sentence packing list for [name] before {trip} two.",
+        "Prompt: Write a two-sentence reminder for [name] about {meeting} three.",
+        "Prompt: Write a two-sentence summary of {book} for [name] four.",
+    ]
+    filler = "This sentence is context and is not a prompt. " * 50
+    parts = [f"{filler}\n\n{prompt}" for prompt in planted]
+    return "\n\n---\n\n".join(parts), planted
+
+
+def smoke_long_extraction() -> dict:
+    """Segmented local extraction of the synthetic thread. No fetch, files, or Telegram."""
+    settings = provider_settings()
+    if settings["provider"] != "ollama":
+        raise PipelineError("provider claude: smoke locale non eseguito.", transient=False)
+    source, planted = smoke_long_source()
+    segments = plan_segments(source, [], settings)
+    if len(segments) < 2:
+        raise PipelineError(
+            f"Lo smoke lungo non richiede segmenti con num_ctx={settings['num_ctx']}.",
+            transient=False,
+        )
+    with exclusive_lock():
+        extraction = extract_with_ollama(source, [], settings)
+    missing = [prompt for prompt in planted if not any(prompt in item["prompt_en"] for item in extraction["prompts"])]
+    if missing:
+        raise PipelineError(f"Smoke lungo incompleto: {len(missing)} prompt non estratti.", transient=False)
+    for item in extraction["prompts"]:
+        if _normalize_prompt(item["prompt_en"]) not in _normalize_prompt(source):
+            raise PipelineError("Smoke lungo: un prompt non è verbatim nella fonte.", transient=False)
+    return {
+        "segments": len(segments),
+        "prompts": len(extraction["prompts"]),
+        "topic": extraction["topic"],
+        "model": settings["model"],
+        "num_ctx": settings["num_ctx"],
+        "num_predict": settings["num_predict"],
+    }
 
 
 def smoke_local_extraction() -> dict:
