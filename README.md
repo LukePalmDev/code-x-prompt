@@ -260,7 +260,7 @@ claude:
 
 While the service `config.yaml` still says `provider: ollama`, this code keeps using Ollama. Switching is that edit in the service clone. It is not in git. A plan-limit error is archived once and is not retried at 15 minutes, 1 hour, and 3 hours. The weekly reset reported for this account is 06:00 Europe/Rome. That is not a 5-hour window.
 
-`claude -p --output-format json` can include `usage` token counts and `total_cost_usd`. Those numbers are copied onto the existing success line when they are present. They are not converted into a quota percent. `/usage` is interactive and is not run. If the JSON has no `rate_limits.five_hour.used_percentage`, the line says `quota_5h non disponibile`.
+`claude -p --output-format json` can include `usage` (`input_tokens` is only the uncached part; cache writes and reads are separate), `total_cost_usd`, and `duration_ms`. The chat reply stays short: result, model, effort, and duration in seconds. Token counts and `total_cost_usd` go to the log as `claude_usage`. That cost is the CLI list-price estimate, not the Pro subscription charge, and it is not shown in Telegram. Tokens are not converted into a percent. `/usage` is interactive and is not run. If the JSON has no `rate_limits.five_hour.used_percentage`, the reply says `Finestra 5h: non disponibile.`
 
 Check the resolved id without a generation, without Telegram, and without fetching X:
 

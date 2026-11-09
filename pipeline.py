@@ -749,22 +749,50 @@ def _real_number(value):
     return value
 
 
+def _cache_creation_tokens(usage: dict):
+    """Prefer the flat total. Nested ephemeral counts are used only when it is absent."""
+    flat = _whole_number(usage.get("cache_creation_input_tokens"))
+    if flat is not None:
+        return flat
+    nested = usage.get("cache_creation")
+    if not isinstance(nested, dict):
+        return None
+    parts = [
+        number for key in ("ephemeral_5m_input_tokens", "ephemeral_1h_input_tokens")
+        if (number := _whole_number(nested.get(key))) is not None
+    ]
+    if not parts:
+        return None
+    return sum(parts)
+
+
+def _copy_token_fields(source: dict, stats: dict, names: tuple) -> None:
+    for key in names:
+        if key in stats:
+            continue
+        number = _whole_number(source.get(key))
+        if number is None and key == "cache_creation_input_tokens":
+            number = _cache_creation_tokens(source)
+        if number is not None:
+            stats[key] = number
+
+
 def collect_claude_stats(response: dict) -> dict:
     """Copy token, cost, and latency fields the CLI JSON actually contains.
 
-    A 5-hour quota percent is recorded only when `rate_limits.five_hour.used_percentage`
-    is present. Tokens and `total_cost_usd` are not turned into a percent.
-    `/usage` is interactive and is not called.
+    `input_tokens` is the uncached portion. Cache writes and reads are separate
+    and are not added into it. A 5-hour percent is recorded only from
+    `rate_limits.five_hour.used_percentage`. `total_cost_usd` stays a CLI
+    list-price estimate. `/usage` is interactive and is not called.
     """
     if not isinstance(response, dict):
         return {}
     stats = {}
     usage = response.get("usage")
     if isinstance(usage, dict):
-        for key in ("input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"):
-            number = _whole_number(usage.get(key))
-            if number is not None:
-                stats[key] = number
+        _copy_token_fields(usage, stats, (
+            "input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens",
+        ))
     model_usage = response.get("modelUsage")
     if not isinstance(model_usage, dict):
         model_usage = response.get("model_usage")
@@ -772,16 +800,27 @@ def collect_claude_stats(response: dict) -> dict:
         name, entry = next(iter(model_usage.items()))
         if isinstance(name, str) and name.strip():
             stats["effective_model"] = name.strip()
-        if isinstance(entry, dict) and "input_tokens" not in stats:
-            for source, dest in (
-                ("inputTokens", "input_tokens"),
-                ("outputTokens", "output_tokens"),
-                ("cacheReadInputTokens", "cache_read_input_tokens"),
-                ("cacheCreationInputTokens", "cache_creation_input_tokens"),
-            ):
-                number = _whole_number(entry.get(source))
-                if number is not None:
-                    stats[dest] = number
+        if isinstance(entry, dict):
+            normalized = {
+                "input_tokens": entry.get("inputTokens", entry.get("input_tokens")),
+                "output_tokens": entry.get("outputTokens", entry.get("output_tokens")),
+                "cache_read_input_tokens": entry.get("cacheReadInputTokens", entry.get("cache_read_input_tokens")),
+                "cache_creation_input_tokens": entry.get(
+                    "cacheCreationInputTokens", entry.get("cache_creation_input_tokens"),
+                ),
+            }
+            nested_usage = entry.get("usage")
+            if isinstance(nested_usage, dict):
+                for key in normalized:
+                    if normalized[key] is None:
+                        normalized[key] = nested_usage.get(key)
+                if normalized["cache_creation_input_tokens"] is None:
+                    normalized["cache_creation_input_tokens"] = _cache_creation_tokens(nested_usage)
+            _copy_token_fields(normalized, stats, tuple(normalized))
+            if "total_cost_usd" not in response:
+                cost = _real_number(entry.get("costUSD", entry.get("cost_usd")))
+                if cost is not None:
+                    stats["total_cost_usd"] = cost
     cost = _real_number(response.get("total_cost_usd"))
     if cost is not None:
         stats["total_cost_usd"] = cost
@@ -798,31 +837,63 @@ def collect_claude_stats(response: dict) -> dict:
     return stats
 
 
+def _duration_label(stats: dict) -> str:
+    millis = stats.get("duration_ms", stats.get("duration_api_ms"))
+    if not isinstance(millis, int):
+        return ""
+    if millis <= 0:
+        return "0 secondi"
+    if millis < 1000:
+        return "meno di un secondo"
+    seconds = int(round(millis / 1000))
+    if seconds == 1:
+        return "1 secondo"
+    return f"{seconds} secondi"
+
+
+def _display_model(model: str) -> str:
+    if model == CLAUDE_SONNET_MODEL:
+        return "Sonnet 5.5"
+    return model
+
+
 def format_claude_stats(stats: dict, model: str, effort: str) -> str:
+    """Short Italian chat line. Token dumps and list-price cost stay in the log."""
     measured = [key for key in (
         "input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens",
-        "total_cost_usd", "duration_ms", "duration_api_ms", "quota_5h_percent",
+        "total_cost_usd", "duration_ms", "duration_api_ms", "quota_5h_percent", "effective_model",
     ) if key in stats]
     if not measured:
         return ""
-    parts = [f"modello {stats.get('effective_model') or model}", f"effort {effort}"]
-    labels = (
-        ("input_tokens", "in"),
-        ("output_tokens", "out"),
-        ("cache_read_input_tokens", "cache_read"),
-        ("cache_creation_input_tokens", "cache_create"),
-        ("total_cost_usd", "cost_usd"),
-        ("duration_ms", "latency_ms"),
-        ("duration_api_ms", "latency_api_ms"),
-    )
-    for key, label in labels:
-        if key in stats:
-            parts.append(f"{label} {stats[key]}")
+    shown = _display_model(stats.get("effective_model") or model)
+    duration = _duration_label(stats)
+    sentence = f"Modello {shown}, effort {effort}"
+    sentence += f", {duration}." if duration else "."
     if "quota_5h_percent" in stats:
-        parts.append(f"quota_5h {stats['quota_5h_percent']}%")
+        quota = f"Finestra 5h: {stats['quota_5h_percent']}%."
     else:
-        parts.append("quota_5h non disponibile")
-    return " ".join(parts)
+        quota = "Finestra 5h: non disponibile."
+    return f"{sentence}\n{quota}"
+
+
+def log_claude_usage(stats: dict, model: str, effort: str) -> None:
+    if not stats:
+        return
+    record = {
+        "configured_model": model,
+        "effort": effort,
+        "effective_model": stats.get("effective_model"),
+        "input_tokens": stats.get("input_tokens"),
+        "output_tokens": stats.get("output_tokens"),
+        "cache_read_input_tokens": stats.get("cache_read_input_tokens"),
+        "cache_creation_input_tokens": stats.get("cache_creation_input_tokens"),
+        "duration_ms": stats.get("duration_ms"),
+        "duration_api_ms": stats.get("duration_api_ms"),
+        "total_cost_usd": stats.get("total_cost_usd"),
+        "total_cost_usd_note": None if "total_cost_usd" not in stats else "cli_list_price_estimate_not_pro_charge",
+        "quota_5h_percent": stats.get("quota_5h_percent"),
+    }
+    log.info("claude_usage %s", json.dumps(record, ensure_ascii=False, sort_keys=True))
 
 
 def run_claude(source: str, existing: list, model: str, effort: str) -> dict:
@@ -872,9 +943,11 @@ def run_claude(source: str, existing: list, model: str, effort: str) -> dict:
         extraction = validate_extraction(response.get("structured_output"))
     except ValueError as exc:
         raise PipelineError(f"Risposta di Claude non valida: {exc}", transient=True)
-    stats = format_claude_stats(collect_claude_stats(response), model, effort)
-    if stats:
-        extraction["_claude_stats"] = stats
+    stats = collect_claude_stats(response)
+    log_claude_usage(stats, model, effort)
+    chat = format_claude_stats(stats, model, effort)
+    if chat:
+        extraction["_claude_stats"] = chat
     return extraction
 
 
